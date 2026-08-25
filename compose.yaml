@@ -1,0 +1,66 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: src/Gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      API_BACKEND_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      - course-net
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Api/Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      COURSE_JWT_ISSUER: moduledev-course
+      COURSE_JWT_AUDIENCE: moduledev-api
+      COURSE_JWT_SIGNING_KEY: ThisIsALocalDevSigningKeyAtLeast32Bytes!
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=runtime_pass;MaxPoolSize=80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - course-net
+
+  cli:
+    build:
+      context: .
+      dockerfile: src/Cli/Dockerfile
+    environment:
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_publication;Password=publication_pass"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - course-net
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: course
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - course-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    networks:
+      - course-net
+
+volumes:
+  course-data:
+
+networks:
+  course-net:
