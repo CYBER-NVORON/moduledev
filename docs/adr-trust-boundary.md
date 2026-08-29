@@ -23,7 +23,7 @@ Gateway выполняет только проксирование HTTP-запр
 
 ### Граница 2: Api изолирован внутри Docker network
 
-Api не публикует host-порты. Доступ к Api возможен только через Gateway внутри `course-net`. Api:
+Api не публикует host-порты. Доступ к Api возможен только через Gateway внутри `gateway-net`. С БД Api общается внутри `course-net`. Api:
 
 - проверяет JWT (issuer, audience, signature, expiry, claims);
 - формирует server-side context (`principal`, `consumer`, `scopes`, `correlationId`, `deadline`);
@@ -36,9 +36,10 @@ Api не публикует host-порты. Доступ к Api возможе�
 |---------------------|----------------------------------------------------------------|
 | `course_owner`      | `NOLOGIN`. Владелец объектов, `SECURITY DEFINER` функций.      |
 | `course_runtime`    | `LOGIN`. Выполняет `api.invoke`. Нет прямого DML к `payment.*`.|
-| `course_publication`| `LOGIN`. Публикация манифестов, миграции.                       |
+| `course_publication`| `LOGIN`. Ограниченная публикация манифестов в `catalog.*`. Без owner-прав и без доступа к `payment.*`. |
+| `course_migration`  | `LOGIN`. Выполнение DDL-миграций структуры схемы (admin).      |
 
-`course_runtime` не может напрямую INSERT/UPDATE/DELETE в `payment.operations` или `payment.operation_events` — только через `SECURITY DEFINER` функции, принадлежащие `course_owner`.
+`course_runtime` не может напрямую INSERT/UPDATE/DELETE в `payment.operations` или `payment.operation_events` — только через `SECURITY DEFINER` функции, принадлежащие `course_owner`. `payment.operations` защищена триггерами неизменяемости и графом допустимых переходов статусов, а `payment.operation_events` является строго append-only.
 
 ## Последствия
 

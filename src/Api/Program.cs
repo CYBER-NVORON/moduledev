@@ -47,21 +47,21 @@ var jwtHandler = new JwtSecurityTokenHandler();
 var app = builder.Build();
 
 // --- Health ---
-app.MapGet("/health/live", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/health/live", () => Results.Ok(new { status = "ok", schema_cache_size = SchemaCache.Count }));
 app.MapGet("/health/ready", async () =>
 {
     try
     {
         await using var conn = new NpgsqlConnection(dbConnection);
         await conn.OpenAsync();
-        await using var cmd = new NpgsqlCommand("SELECT 1", conn);
-        await cmd.ExecuteScalarAsync();
-        return Results.Ok(new { status = "ok" });
+        await using var cmd = new NpgsqlCommand("SELECT to_regclass('catalog.actions') IS NOT NULL AND to_regproc('api.invoke') IS NOT NULL", conn);
+        var ready = (bool)(await cmd.ExecuteScalarAsync() ?? false);
+        if (!ready) return Results.Json(new { status = "error", code = "dependency.unavailable", message = "migrations not applied" }, statusCode: 503);
+        return Results.Ok(new { status = "ok", schema_cache_size = SchemaCache.Count });
     }
-    catch
+    catch (Exception)
     {
-        return Results.Json(new { status = "error", code = "dependency.unavailable", message = "database not ready" },
-            statusCode: 503);
+        return Results.Json(new { status = "error", code = "dependency.unavailable", message = "database not ready" }, statusCode: 503);
     }
 });
 
@@ -71,7 +71,7 @@ app.MapGet("/openapi/default.json", async () =>
     try
     {
         var actions = await LoadActions(enabled: true, isDefault: true);
-        return Results.Json(BuildOpenApiDoc(actions));
+        return Results.Json(BuildOpenApiDoc(actions, false));
     }
     catch (NpgsqlException)
     {
@@ -85,7 +85,7 @@ app.MapGet("/openapi/actions/{module}/{action}/{version}.json", async (string mo
     {
         var actions = await LoadActions(module: module, action: action, version: version);
         if (actions.Count == 0) return Results.Json(ErrorEnvelope("action.not_found", "action not found", null), statusCode: 404);
-        return Results.Json(BuildOpenApiDoc(actions));
+        return Results.Json(BuildOpenApiDoc(actions, true));
     }
     catch (NpgsqlException)
     {
@@ -96,6 +96,7 @@ app.MapGet("/openapi/actions/{module}/{action}/{version}.json", async (string mo
 // --- Generic Action Route ---
 app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, string action) =>
 {
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
     string? correlationId = Guid.NewGuid().ToString();
     int? actionVersion = null;
     string principal = "";
@@ -104,11 +105,18 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
     try
     {
         // 1. JWT Authentication
-        (principal, var consumer, var scopes, var authErr) = ValidateJwt(ctx);
+        var authHeader = ctx.Request.Headers.Authorization.FirstOrDefault();
+        string tokenStr = authHeader?.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) == true ? authHeader["Bearer ".Length..].Trim() : "";
+        (principal, var consumer, var scopes, var authErr) = Api.ApiHelpers.ValidateJwt(tokenStr, tokenValidationParams, jwtHandler);
         if (authErr is not null)
             return await ErrorResultAsync(401, "auth.invalid", authErr);
 
-        // 2. Parse version header
+        // 2. Read body to get hash, then parse (zero-allocation)
+        ctx.Request.EnableBuffering();
+        payloadHash = Convert.ToHexStringLower(await System.Security.Cryptography.SHA256.HashDataAsync(ctx.Request.Body, ctx.RequestAborted));
+        ctx.Request.Body.Position = 0;
+
+        // 3. Parse version header
         int? requestedVersion = null;
         if (ctx.Request.Headers.TryGetValue("X-Action-Version", out var versionHeader))
         {
@@ -118,15 +126,6 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 return await ErrorResultAsync(400, "request.invalid", "invalid X-Action-Version header");
             requestedVersion = v;
         }
-
-        // 3. Read body to get hash, then parse (zero-allocation)
-        ctx.Request.EnableBuffering();
-        using (var sha = System.Security.Cryptography.SHA256.Create())
-        {
-            var bytes = await sha.ComputeHashAsync(ctx.Request.Body, ctx.RequestAborted);
-            payloadHash = Convert.ToHexString(bytes).ToLowerInvariant();
-        }
-        ctx.Request.Body.Position = 0;
 
         JsonObject? payload;
         try
@@ -181,7 +180,34 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     return await ErrorResultAsync(400, "idempotency.required", "Idempotency-Key header is required");
                 }
 
-                // 8. Request schema validation
+                // 8. Build server-side context
+                var context = JsonSerializer.SerializeToNode(new { principal, consumer, scopes, correlationId, requestId = idempotencyKey ?? "", deadline = DateTime.UtcNow.AddMilliseconds(manifest.TimeoutMs) });
+
+                // 8.5. Cross-version replay check (before schema validation)
+                if (requestedVersion is null && !string.IsNullOrEmpty(idempotencyKey))
+                {
+                    await using var replayCmd = new NpgsqlCommand(
+                        "SELECT api.check_replay(@module, @action, @context::jsonb, @payload::jsonb)", conn, tx);
+                    replayCmd.Parameters.AddWithValue("module", module);
+                    replayCmd.Parameters.AddWithValue("action", action);
+                    replayCmd.Parameters.AddWithValue("context", context.ToJsonString());
+                    replayCmd.Parameters.AddWithValue("payload", payload?.ToJsonString() ?? "{}");
+                    var replayJson = await replayCmd.ExecuteScalarAsync() as string;
+                    if (replayJson is not null)
+                    {
+                        await tx.CommitAsync();
+                        var replayNode = JsonNode.Parse(replayJson);
+                        var status = replayNode?["status"]?.ToString();
+                        var code = replayNode?["code"]?.ToString();
+                        if (status == "error" && code == "idempotency.conflict")
+                        {
+                            return await ErrorResultAsync(409, "idempotency.conflict", replayNode?["message"]?.ToString() ?? "conflict");
+                        }
+                        return Results.Json(replayNode, statusCode: 200);
+                    }
+                }
+
+                // 9. Request schema validation
                 if (manifest.RequestSchema is not null)
                 {
                     var schemaResult = manifest.RequestSchema.Evaluate(payload, new EvaluationOptions
@@ -196,18 +222,6 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     }
                 }
 
-                // 9. Build server-side context
-                var deadline = DateTime.UtcNow.AddMilliseconds(manifest.TimeoutMs).ToString("O");
-                var context = new JsonObject
-                {
-                    ["principal"] = principal,
-                    ["consumer"] = consumer,
-                    ["scopes"] = JsonSerializer.SerializeToNode(scopes),
-                    ["correlationId"] = correlationId,
-                    ["requestId"] = idempotencyKey ?? "",
-                    ["deadline"] = deadline
-                };
-
                 // 10. Execute api.invoke (same conn/tx)
                 await using var cmd = new NpgsqlCommand(
                     "SELECT api.invoke(@module, @action, @version, @context::jsonb, @payload::jsonb)", conn, tx);
@@ -220,9 +234,9 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 cmd.CommandTimeout = Math.Max(1, (int)Math.Ceiling(manifest.TimeoutMs / 1000.0) + 1);
                 cmd.Parameters.AddWithValue("module", module);
                 cmd.Parameters.AddWithValue("action", action);
-                cmd.Parameters.AddWithValue("version", manifest.Version);
-                cmd.Parameters.AddWithValue("context", context.ToJsonString());
-                cmd.Parameters.AddWithValue("payload", payload.ToJsonString());
+                cmd.Parameters.AddWithValue("version", requestedVersion.HasValue ? (object)requestedVersion.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("context", context?.ToJsonString() ?? "{}");
+                cmd.Parameters.AddWithValue("payload", payload?.ToJsonString() ?? "{}");
 
                 var dbResult = await cmd.ExecuteScalarAsync(ctx.RequestAborted) as string;
                 if (dbResult is null)
@@ -238,40 +252,16 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     return await ErrorResultAsync(500, "action.contract_violation", "database function returned invalid JSON");
                 }
 
-                if (dbNode is not JsonObject dbObject)
-                {
-                    await tx.RollbackAsync();
-                    return await ErrorResultAsync(500, "action.contract_violation", "database function returned a non-object envelope");
-                }
-
-                var dbStatus = dbObject["status"] is JsonValue statusValue
-                    && statusValue.TryGetValue<string>(out var parsedStatus)
-                    ? parsedStatus
-                    : null;
-                var dbOutcome = dbObject["outcome"] is JsonValue outcomeValue
-                    && outcomeValue.TryGetValue<string>(out var parsedOutcome)
-                    ? parsedOutcome
-                    : null;
-
-                if (dbStatus != "ok" && dbStatus != "error")
-                {
-                    await tx.RollbackAsync();
-                    return await ErrorResultAsync(500, "action.contract_violation", "database function returned an invalid status");
-                }
+                var dbObject = dbNode.AsObject();
+                var dbStatus = dbObject["status"]!.GetValue<string>();
+                var dbOutcome = dbObject["outcome"]?.GetValue<string>();
 
                 // If DB returned error -> ROLLBACK
                 if (dbStatus == "error")
                 {
                     await tx.RollbackAsync();
-                    if (dbObject["code"] is not JsonValue codeValue
-                        || !codeValue.TryGetValue<string>(out var errCode)
-                        || string.IsNullOrWhiteSpace(errCode)
-                        || dbObject["message"] is not JsonValue messageValue
-                        || !messageValue.TryGetValue<string>(out var errMsg)
-                        || string.IsNullOrWhiteSpace(errMsg))
-                    {
-                        return await ErrorResultAsync(500, "action.contract_violation", "database function returned an invalid error envelope");
-                    }
+                    var errCode = dbObject["code"]!.GetValue<string>();
+                    var errMsg = dbObject["message"]!.GetValue<string>();
 
                     // Idempotency conflict and access.denied pass through with proper HTTP codes
                     var httpStatus = errCode switch
@@ -280,9 +270,24 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                         "access.denied" => 403,
                         "action.not_found" => 404,
                         "operation.not_found" => 404,
+                        "payload.invalid" => 422,
+                        "auth.invalid" => 401,
+                        "request.invalid" => 400,
+                        "idempotency.required" => 400,
                         "action.contract_violation" => 500,
+                        "internal.error" => 500,
+                        "dependency.unavailable" => 503,
+                        "action.timeout" => 504,
                         _ => 400
                     };
+
+                    if (httpStatus >= 500)
+                    {
+                        app.Logger.LogError("Target error hidden from client: {Code} - {Message}", errCode, errMsg);
+                        var safeCode = errCode == "action.contract_violation" ? "action.contract_violation" : "internal.error";
+                        var safeMessage = errCode == "action.contract_violation" ? "contract violation" : "internal server error";
+                        return await ErrorResultAsync(httpStatus, safeCode, safeMessage);
+                    }
 
                     return Results.Json(new
                     {
@@ -293,6 +298,18 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                         details = new { },
                         meta = new { correlationId, actionVersion }
                     }, statusCode: httpStatus);
+                }
+
+                var isReplay = dbObject.TryGetPropertyValue("__is_replay", out var isReplayNode)
+                    && isReplayNode is JsonValue isReplayVal
+                    && isReplayVal.TryGetValue<bool>(out var isRep)
+                    && isRep;
+
+                if (isReplay)
+                {
+                    await tx.CommitAsync();
+                    dbObject.Remove("__is_replay");
+                    return Results.Json(dbObject, statusCode: 200);
                 }
 
                 // Check outcome against manifest
@@ -327,20 +344,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 // All good -> COMMIT
                 await tx.CommitAsync();
 
-                // Idempotent replay: DB returned stored envelope with its own meta → pass through
-                if (dbObject["meta"] is JsonObject existingMeta
-                    && existingMeta["correlationId"] is not null)
-                {
-                    return Results.Json(dbObject, statusCode: 200);
-                }
-
-                return Results.Json(new
-                {
-                    status = "ok",
-                    outcome = dbOutcome,
-                    result = dbObject["result"],
-                    meta = new { correlationId, actionVersion }
-                }, statusCode: 200);
+                return Results.Json(dbObject, statusCode: 200);
             }
             catch (NpgsqlException ex) when (ex is PostgresException { SqlState: "57014" }
                 || ex.InnerException is TimeoutException)
@@ -359,7 +363,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
             app.Logger.LogError(pex, "Database error in action {Module}.{Action}", module, action);
             return await ErrorResultAsync(500, "internal.error", "internal server error");
         }
-        catch (Exception ex) when (IsTransientDatabaseError(ex))
+        catch (Exception ex) when (Api.ApiHelpers.IsTransientDatabaseError(ex))
         {
             return await ErrorResultAsync(503, "dependency.unavailable", "database unavailable");
         }
@@ -373,14 +377,17 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
     async Task LogDispatchErrorAsync(string code, string? outcome)
     {
         if (string.IsNullOrEmpty(principal)) return; // Don't log if we don't have a principal
+        if (string.IsNullOrEmpty(payloadHash)) return; // Pre-admission, don't log
+        
+        stopwatch.Stop();
         var reqId = ctx.Request.Headers["Idempotency-Key"].FirstOrDefault();
         try
         {
             await using var logConn = new NpgsqlConnection(dbConnection);
             await logConn.OpenAsync();
             await using var cmd = new NpgsqlCommand(
-                "INSERT INTO catalog.action_dispatches (correlation_id, request_id, module, action, version, principal, payload_hash, status, outcome) " +
-                "VALUES (@corr::uuid, @req, @mod, @act, @ver, @prin, @hash, 'ERROR', @out)", logConn);
+                "INSERT INTO catalog.action_dispatches (correlation_id, request_id, module, action, version, principal, payload_hash, status, outcome, error_code, duration_ms, replay_marker) " +
+                "VALUES (@corr::uuid, @req, @mod, @act, @ver, @prin, @hash, 'ERROR', @out, @code, @dur, false)", logConn);
             cmd.Parameters.AddWithValue("corr", correlationId ?? Guid.NewGuid().ToString());
             cmd.Parameters.AddWithValue("req", (object?)reqId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("mod", module);
@@ -389,6 +396,8 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
             cmd.Parameters.AddWithValue("prin", principal);
             cmd.Parameters.AddWithValue("hash", payloadHash);
             cmd.Parameters.AddWithValue("out", (object?)outcome ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("code", code);
+            cmd.Parameters.AddWithValue("dur", (int)stopwatch.ElapsedMilliseconds);
             await cmd.ExecuteNonQueryAsync();
         }
         catch { /* best effort */ }
@@ -417,105 +426,20 @@ app.MapFallback((HttpContext ctx) =>
 
 app.Run();
 
-// --- JWT Validation ---
-(string principal, string consumer, List<string> scopes, string? error) ValidateJwt(HttpContext ctx)
-{
-    var authHeader = ctx.Request.Headers.Authorization.FirstOrDefault();
-    if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-        return (null!, null!, null!, "missing or invalid Authorization header");
 
-    var token = authHeader["Bearer ".Length..].Trim();
-    if (string.IsNullOrEmpty(token))
-        return (null!, null!, null!, "empty token");
-
-    try
-    {
-        var handler = jwtHandler;
-        handler.ValidateToken(token, tokenValidationParams, out var validatedToken);
-
-        if (validatedToken is not JwtSecurityToken jwt)
-            return (null!, null!, null!, "invalid token type");
-
-        // Strict claim type validation
-        var issClaim = jwt.Payload["iss"];
-        if (issClaim is not string)
-            return (null!, null!, null!, "iss claim must be a string");
-
-        if (!jwt.Payload.TryGetValue("aud", out var audClaim) || audClaim is not string)
-            return (null!, null!, null!, "aud claim must be a string");
-        if (!jwt.Payload.TryGetValue("iat", out var iatClaim) || !IsNumericDateClaim(iatClaim))
-            return (null!, null!, null!, "iat claim must be a number");
-        if (!jwt.Payload.TryGetValue("exp", out var expClaim) || !IsNumericDateClaim(expClaim))
-            return (null!, null!, null!, "exp claim must be a number");
-
-        // Reject non-string sub (e.g. numeric 42 in JWT payload)
-        // JwtSecurityTokenHandler auto-converts "sub" to string, so we must inspect the raw JSON.
-        var parts = token.Split('.');
-        if (parts.Length != 3) return (null!, null!, null!, "invalid token format");
-        
-        var payloadJson = Base64UrlEncoder.Decode(parts[1]);
-        var rawNode = JsonNode.Parse(payloadJson);
-        if (rawNode?["sub"] is not JsonValue subVal || !subVal.TryGetValue<string>(out _) || subVal.GetValue<JsonElement>().ValueKind != JsonValueKind.String)
-            return (null!, null!, null!, "sub claim must be a non-empty string");
-
-        var sub = subVal.GetValue<string>();
-        if (string.IsNullOrEmpty(sub))
-            return (null!, null!, null!, "sub claim is required");
-
-        var consumerClaim = jwt.Payload.TryGetValue("consumer", out var consumerObj) ? consumerObj : null;
-        if (consumerClaim is not string consumerStr || string.IsNullOrEmpty(consumerStr))
-            return (null!, null!, null!, "consumer claim must be a non-empty string");
-
-        var scopeClaim = jwt.Payload.TryGetValue("scope", out var scopeObj) ? scopeObj : null;
-        if (scopeClaim is not string scopeStr)
-            return (null!, null!, null!, "scope claim must be a string");
-
-        var scopes = string.IsNullOrWhiteSpace(scopeStr)
-            ? new List<string>()
-            : scopeStr.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
-
-        return (sub, consumerStr, scopes, null);
-    }
-    catch (SecurityTokenExpiredException)
-    {
-        return (null!, null!, null!, "token expired");
-    }
-    catch (SecurityTokenException)
-    {
-        return (null!, null!, null!, "invalid token");
-    }
-    catch (Exception)
-    {
-        return (null!, null!, null!, "token validation failed");
-    }
-}
 
 // --- Action Manifest Loading ---
 async Task<ActionManifest?> LoadManifest(string module, string action, int? version,
     NpgsqlConnection conn, NpgsqlTransaction tx)
 {
-    string sql;
-    NpgsqlCommand cmd;
-
-    if (version.HasValue)
-    {
-        sql = "SELECT version, manifest_json, target_schema, target_function, outcomes, " +
+    var sql = "SELECT version, manifest_json, target_schema, target_function, outcomes, " +
               "required_policy, idempotency_mode, idempotency_scope, timeout_ms, enabled " +
-              "FROM catalog.actions WHERE module=@m AND action=@a AND version=@v";
-        cmd = new NpgsqlCommand(sql, conn, tx);
-        cmd.Parameters.AddWithValue("m", module);
-        cmd.Parameters.AddWithValue("a", action);
-        cmd.Parameters.AddWithValue("v", version.Value);
-    }
-    else
-    {
-        sql = "SELECT version, manifest_json, target_schema, target_function, outcomes, " +
-              "required_policy, idempotency_mode, idempotency_scope, timeout_ms, enabled " +
-              "FROM catalog.actions WHERE module=@m AND action=@a AND is_default=true AND enabled=true";
-        cmd = new NpgsqlCommand(sql, conn, tx);
-        cmd.Parameters.AddWithValue("m", module);
-        cmd.Parameters.AddWithValue("a", action);
-    }
+              "FROM catalog.actions WHERE module=@m AND action=@a " +
+              (version.HasValue ? "AND version=@v" : "AND is_default=true AND enabled=true");
+    var cmd = new NpgsqlCommand(sql, conn, tx);
+    cmd.Parameters.AddWithValue("m", module);
+    cmd.Parameters.AddWithValue("a", action);
+    if (version.HasValue) cmd.Parameters.AddWithValue("v", version.Value);
 
     await using (cmd)
     {
@@ -532,32 +456,11 @@ async Task<ActionManifest?> LoadManifest(string module, string action, int? vers
         var outcomes = JsonSerializer.Deserialize<List<string>>(reader.GetString(4)) ?? new();
         var requiredPolicy = JsonSerializer.Deserialize<List<string>>(reader.GetString(5)) ?? new();
 
-        JsonSchema? requestSchema = null;
-        JsonSchema? responseSchema = null;
-        if (manifestNode?["request_schema"] is JsonNode reqSchemaNode)
-        {
-            var reqText = reqSchemaNode.ToJsonString();
-            requestSchema = SchemaCache.GetOrAdd(reqText, text => JsonSchema.FromText(text));
-        }
-        if (manifestNode?["response_schema"] is JsonNode resSchemaNode)
-        {
-            var resText = resSchemaNode.ToJsonString();
-            responseSchema = SchemaCache.GetOrAdd(resText, text => JsonSchema.FromText(text));
-        }
+        JsonSchema? GetSchema(string key) => manifestNode?[key] is JsonNode n ? SchemaCache.GetOrAdd(n.ToJsonString(), text => { if (SchemaCache.Count > 1000) SchemaCache.Clear(); return JsonSchema.FromText(text); }) : null;
+        var requestSchema = GetSchema("request_schema");
+        var responseSchema = GetSchema("response_schema");
 
-        return new ActionManifest
-        {
-            Version = ver,
-            TargetSchema = reader.GetString(2),
-            TargetFunction = reader.GetString(3),
-            Outcomes = outcomes,
-            RequiredPolicy = requiredPolicy,
-            IdempotencyMode = reader.GetString(6),
-            IdempotencyScope = reader.GetString(7),
-            TimeoutMs = reader.GetInt32(8),
-            RequestSchema = requestSchema,
-            ResponseSchema = responseSchema,
-        };
+        return new ActionManifest(ver, reader.GetString(2), reader.GetString(3), outcomes, requiredPolicy, reader.GetString(6), reader.GetString(7), reader.GetInt32(8), requestSchema, responseSchema);
     }
 }
 
@@ -591,83 +494,33 @@ async Task<List<ActionInfo>> LoadActions(bool enabled = false, bool isDefault = 
     return list;
 }
 
-object BuildOpenApiDoc(List<ActionInfo> actions)
+object BuildOpenApiDoc(List<ActionInfo> actions, bool isVersionSpecific)
 {
-    var paths = new Dictionary<string, object>();
-    foreach (var a in actions)
+    var paths = actions.ToDictionary(a => $"/api/{a.Module}/{a.Action}", a =>
     {
-        var path = $"/api/{a.Module}/{a.Action}";
         var manifestNode = JsonNode.Parse(a.ManifestJson);
-        var requestSchema = manifestNode?["request_schema"];
-        var responseSchema = manifestNode?["response_schema"];
-
-        var responseRequired = responseSchema is not null
-            ? new[] { "status", "outcome", "meta", "result" }
-            : new[] { "status", "outcome", "meta" };
-
-        var operation = new Dictionary<string, object>
+        var req = manifestNode?["request_schema"];
+        var res = manifestNode?["response_schema"];
+        var outcomes = manifestNode?["outcomes"]?.AsArray()?.Select(x => x?.ToString()).ToList() ?? new List<string?>();
+        var op = new
         {
-            ["operationId"] = $"{a.Module}.{a.Action}.v{a.Version}",
-            ["summary"] = $"{a.Module}.{a.Action} v{a.Version}",
-            ["parameters"] = new object[]
+            operationId = $"{a.Module}.{a.Action}.v{a.Version}",
+            summary = $"{a.Module}.{a.Action} v{a.Version}",
+            parameters = new[] { new { name = "X-Action-Version", @in = "header", required = isVersionSpecific, schema = new { @const = a.Version } } },
+            requestBody = new { required = true, content = new Dictionary<string, object> { ["application/json"] = new { schema = req is not null ? JsonSerializer.Deserialize<object>(req.ToJsonString()) : new { type = "object" } } } },
+            responses = new Dictionary<string, object>
             {
-                new Dictionary<string, object>
-                {
-                    ["name"] = "X-Action-Version",
-                    ["in"] = "header",
-                    ["required"] = false,
-                    ["schema"] = new Dictionary<string, object> { ["const"] = a.Version }
-                }
-            },
-            ["requestBody"] = new Dictionary<string, object>
-            {
-                ["required"] = true,
-                ["content"] = new Dictionary<string, object>
-                {
-                    ["application/json"] = new Dictionary<string, object?>
-                    {
-                        ["schema"] = requestSchema is not null
-                            ? JsonSerializer.Deserialize<object>(requestSchema.ToJsonString())
-                            : new { type = "object" }
-                    }
-                }
-            },
-            ["responses"] = new Dictionary<string, object>
-            {
-                ["200"] = new Dictionary<string, object>
-                {
-                    ["description"] = "Success",
-                    ["content"] = new Dictionary<string, object>
-                    {
-                        ["application/json"] = new Dictionary<string, object?>
-                        {
-                            ["schema"] = new Dictionary<string, object?>
-                            {
-                                ["type"] = "object",
-                                ["required"] = responseRequired,
-                                ["properties"] = new Dictionary<string, object?>
-                                {
-                                    ["status"] = new { type = "string" },
-                                    ["outcome"] = new { type = "string" },
-                                    ["meta"] = new { type = "object" },
-                                    ["result"] = responseSchema is not null
-                                        ? JsonSerializer.Deserialize<object>(responseSchema.ToJsonString())
-                                        : new { type = "object" }
-                                }
-                            }
-                        }
-                    }
-                }
+                ["200"] = new { description = "Success", content = new Dictionary<string, object> { ["application/json"] = new { schema = new { type = "object", required = res is not null ? new[] { "status", "outcome", "meta", "result" } : new[] { "status", "outcome", "meta" }, properties = new Dictionary<string, object> { ["status"] = new { @const = "ok" }, ["outcome"] = new { @enum = outcomes }, ["meta"] = new { type = "object", required = new[] { "correlationId", "actionVersion" } }, ["result"] = res is not null ? JsonSerializer.Deserialize<object>(res.ToJsonString())! : new { type = "object" } } } } } },
+                ["400"] = new { description = "Bad Request" }
             }
         };
-
-        paths[path] = new Dictionary<string, object> { ["post"] = operation };
-    }
+        return (object)new Dictionary<string, object> { ["post"] = op };
+    });
 
     return new
     {
-        openapi = "3.0.3",
-        info = new { title = "Course Action Runtime", version = "1.0.0" },
+        openapi = "3.1.0",
+        info = new { title = "Module API", version = "1.0.0" },
         paths
     };
 }
@@ -694,37 +547,12 @@ object ErrorEnvelope(string code, string message, string? correlationId, int? ac
 string Env(string name) => Environment.GetEnvironmentVariable(name)
     ?? throw new InvalidOperationException($"{name} not set");
 
-bool IsNumericDateClaim(object? value) => value switch
-{
-    byte or sbyte or short or ushort or int or uint or long or ulong => true,
-    JsonElement element => element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out _),
-    _ => false
-};
 
-bool IsTransientDatabaseError(Exception ex) => ex switch
-{
-    PostgresException => false,
-    NpgsqlException npgsql => npgsql.InnerException is System.Net.Sockets.SocketException
-        or System.IO.IOException or TimeoutException,
-    System.Net.Sockets.SocketException or System.IO.IOException or TimeoutException => true,
-    _ when ex.InnerException is not null => IsTransientDatabaseError(ex.InnerException),
-    _ => false
-};
+
 
 // --- Models ---
 
-class ActionManifest
-{
-    public int Version { get; init; }
-    public string TargetSchema { get; init; } = "";
-    public string TargetFunction { get; init; } = "";
-    public List<string> Outcomes { get; init; } = new();
-    public List<string> RequiredPolicy { get; init; } = new();
-    public string IdempotencyMode { get; init; } = "none";
-    public string IdempotencyScope { get; init; } = "none";
-    public int TimeoutMs { get; init; } = 5000;
-    public JsonSchema? RequestSchema { get; init; }
-    public JsonSchema? ResponseSchema { get; init; }
-}
+public record ActionManifest(int Version, string TargetSchema, string TargetFunction, List<string> Outcomes, List<string> RequiredPolicy, string IdempotencyMode, string IdempotencyScope, int TimeoutMs, JsonSchema? RequestSchema, JsonSchema? ResponseSchema);
 
-record ActionInfo(string Module, string Action, int Version, string ManifestJson, bool Enabled, bool IsDefault);
+public record ActionInfo(string Module, string Action, int Version, string ManifestJson, bool Enabled, bool IsDefault);
+public partial class ApiProgram { }

@@ -63,16 +63,7 @@ async Task ProxyRequest(HttpContext ctx, IHttpClientFactory httpFactory)
             request.Content = new StreamContent(ctx.Request.Body);
             if (ctx.Request.ContentType is not null)
             {
-                if (System.Net.Http.Headers.MediaTypeHeaderValue.TryParse(ctx.Request.ContentType, out var mediaType))
-                    request.Content.Headers.ContentType = mediaType;
-                else
-                {
-                    ctx.Response.StatusCode = 400;
-                    ctx.Response.ContentType = "application/json";
-                    await ctx.Response.WriteAsync(
-                        """{"status":"error","code":"request.invalid","message":"invalid Content-Type header"}""");
-                    return;
-                }
+                request.Content.Headers.TryAddWithoutValidation("Content-Type", ctx.Request.ContentType);
             }
         }
 

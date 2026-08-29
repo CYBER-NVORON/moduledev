@@ -206,7 +206,9 @@ BEGIN
         WHERE n.nspname = v_rec.target_schema
           AND p.proname = v_rec.target_function
           AND p.prokind = 'f'
+          AND NOT p.proretset
           AND p.pronargs = 2
+          AND (p.proargmodes IS NULL OR p.proargmodes = ARRAY['i', 'i']::"char"[])
           AND p.proargtypes = ARRAY['jsonb'::regtype, 'jsonb'::regtype]::oidvector
           AND p.prorettype = 'jsonb'::regtype
     ) THEN
@@ -228,11 +230,11 @@ BEGIN
         END IF;
 
         IF v_scope_key IS NOT NULL THEN
-            -- Используем перегрузку pg_advisory_xact_lock(int, int) для 64-битного пространства блокировок,
-            -- чтобы исключить коллизии хэшей под высокой нагрузкой (Birthday paradox).
+            -- Используем перегрузку pg_advisory_xact_lock(int, int) для 64-битного пространства блокировок.
+            -- Раздельное хеширование scope_key и request_id даёт лучшее распределение бит.
             PERFORM pg_advisory_xact_lock(
-                hashtext(v_scope_key || ':' || v_request_id),
-                hashtext(v_request_id || ':' || v_scope_key)
+                hashtext(v_scope_key),
+                hashtext(v_request_id)
             );
 
             SELECT * INTO v_existing
@@ -249,12 +251,21 @@ BEGIN
                     );
                 END IF;
 
-                -- Replay: return stored response envelope as-is (original correlationId)
+                -- Explicit mismatch
+                IF p_version IS NOT NULL AND p_version != v_existing.executed_version THEN
+                    RETURN jsonb_build_object(
+                        'status', 'error',
+                        'code', 'idempotency.conflict',
+                        'message', 'same idempotency key with different explicit version'
+                    );
+                END IF;
+
+                -- Replay: return stored response envelope as-is
                 INSERT INTO catalog.action_dispatches
-                    (correlation_id, request_id, module, action, version, principal, payload_hash, status, outcome)
+                    (correlation_id, request_id, module, action, version, principal, payload_hash, status, outcome, replay_marker)
                 VALUES
-                    (v_correlation::uuid, v_request_id, p_module, p_action, v_rec.version,
-                     v_principal, v_payload_hash, 'OK', v_existing.response_json->>'outcome');
+                    (v_correlation::uuid, v_request_id, p_module, p_action, v_existing.executed_version,
+                     v_principal, v_payload_hash, 'OK', v_existing.response_json->>'outcome', true);
 
                 RETURN v_existing.response_json;
             END IF;
@@ -299,6 +310,7 @@ BEGIN
                 'message', 'target returned an invalid error envelope'
             );
         END IF;
+
         RETURN v_target_result;
     END IF;
 
@@ -324,15 +336,15 @@ BEGIN
 
     -- Success: log dispatch
     INSERT INTO catalog.action_dispatches
-        (correlation_id, request_id, module, action, version, principal, payload_hash, status, outcome)
+        (correlation_id, request_id, module, action, version, principal, payload_hash, status, outcome, replay_marker)
     VALUES
         (v_correlation::uuid, v_request_id, p_module, p_action, v_rec.version,
-         v_principal, v_payload_hash, 'OK', v_outcome);
+         v_principal, v_payload_hash, 'OK', v_outcome, false);
 
     -- Store idempotency record if applicable
     IF v_scope_key IS NOT NULL AND v_request_id IS NOT NULL AND v_request_id != '' THEN
-        INSERT INTO idempotency.records (idempotency_key, scope_key, payload_hash, response_json)
-        VALUES (v_request_id, v_scope_key, v_payload_hash, v_result)
+        INSERT INTO idempotency.records (idempotency_key, scope_key, payload_hash, response_json, executed_version, manifest_hash)
+        VALUES (v_request_id, v_scope_key, v_payload_hash, v_result, v_rec.version, v_rec.manifest_hash)
         ON CONFLICT (scope_key, idempotency_key) DO NOTHING;
     END IF;
 
@@ -341,7 +353,10 @@ END;
 $$;
 
 ALTER FUNCTION api.invoke(text, text, integer, jsonb, jsonb) OWNER TO course_owner;
+REVOKE EXECUTE ON FUNCTION api.invoke(text, text, integer, jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION api.invoke(text, text, integer, jsonb, jsonb) TO course_runtime;
+
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 -- ============================================================
 -- 3. BUSINESS FUNCTION: payment.request_v1
@@ -360,10 +375,7 @@ DECLARE
     v_payload_hash   text;
     v_op_id          uuid;
 BEGIN
-    v_request_id   := NULLIF(p_context->>'requestId', '');
-    IF v_request_id IS NULL THEN
-        v_request_id := gen_random_uuid()::text;
-    END IF;
+    v_request_id   := p_context->>'requestId';
     v_payload_hash := encode(sha256(convert_to(p_payload::text, 'UTF8')), 'hex');
 
     -- Create operation
@@ -399,6 +411,7 @@ END;
 $$;
 
 ALTER FUNCTION payment.request_v1(jsonb, jsonb) OWNER TO course_owner;
+REVOKE EXECUTE ON FUNCTION payment.request_v1(jsonb, jsonb) FROM PUBLIC;
 
 -- ============================================================
 -- 4. BUSINESS FUNCTION: operation.get_v1
@@ -443,6 +456,7 @@ END;
 $$;
 
 ALTER FUNCTION operation.get_v1(jsonb, jsonb) OWNER TO course_owner;
+REVOKE EXECUTE ON FUNCTION operation.get_v1(jsonb, jsonb) FROM PUBLIC;
 
 -- ============================================================
 -- 5. REGISTER BUILT-IN ACTIONS

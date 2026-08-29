@@ -4,13 +4,14 @@
 
 ### Архитектура
 
-Система состоит из 4 контейнеров, описанных в `compose.yaml`:
+Система состоит из 5 контейнеров, описанных в `compose.yaml`:
 
 | Сервис     | Роль                                                                                      |
 |------------|-------------------------------------------------------------------------------------------|
 | `gateway`  | C# ASP.NET Core reverse proxy на порту `8080`. Проксирует `/api/`, `/openapi/`, health.   |
 | `api`      | Внутренний action runtime. Generic route `POST /api/{module}/{action}`, JWT, транзакции.   |
-| `cli`      | Course CLI — публикация манифестов, миграции, управление версиями actions.                 |
+| `cli`      | Course CLI — публикация манифестов, управление версиями actions.                 |
+| `migrator` | Выполняет автоматическое применение SQL-миграций структуры схемы (admin).                |
 | `postgres` | PostgreSQL 16. Авторитетное хранилище: catalog, idempotency, payment, autocheck.          |
 
 Потоки данных: `Client → gateway → api → postgres`. Gateway не имеет доступа к БД.
@@ -23,13 +24,19 @@ ADR о результатах: [docs/adr-results.md](docs/adr-results.md)
 
 Требования: Docker и Docker Compose.
 
-```bash
-docker compose up -d --build
-```
+1. Скопируйте шаблон переменных окружения в `.env`:
+   - Linux/macOS: `cp .env.example .env`
+   - Windows (PowerShell / cmd): `copy .env.example .env`
+2. Запустите стек сервисов:
+   ```bash
+   docker compose up -d --build
+   ```
 
-Сервис доступен по адресу `http://localhost:8080`. После запуска `postgres` проходит healthcheck, `api` подключается к БД, `gateway` начинает проксирование.
+Сервис доступен по адресу `http://localhost:8080`. После запуска `postgres` проходит healthcheck, сервис `migrator` автоматически накатывает SQL-миграции, `api` подключается к БД и регистрирует маршруты, а `gateway` начинает проксирование запросов. Проверить готовность можно запросом к `/health/ready`.
 
 ### Конфигурация
+
+Все настраиваемые параметры и пароли вынесены в файл `.env` (шаблон доступен в `.env.example`).
 
 | Переменная               | Сервис   | Описание                              |
 |--------------------------|----------|---------------------------------------|
@@ -39,12 +46,13 @@ docker compose up -d --build
 | `COURSE_DB_CONNECTION`   | `api`    | Строка подключения к PostgreSQL       |
 | `API_BACKEND_URL`        | `gateway`| URL внутреннего API (Compose DNS)     |
 | `COURSE_DB_CONNECTION`   | `cli`    | Строка подключения (role: publication)|
+| `COURSE_MIGRATION_DB_CONNECTION` | `cli`, `migrator` | Строка подключения для миграций (role: migration) |
 
 Реальные секреты в репозитории не хранятся. Проверка подменяет signing key через Compose override.
 
 ### Миграции
 
-SQL-миграции находятся в `migrations/` и монтируются в `postgres` как init-скрипты (`/docker-entrypoint-initdb.d`). Применяются автоматически при первом запуске контейнера PostgreSQL.
+SQL-миграции находятся в `migrations/`. Они применяются автоматически отдельным сервисом `migrator` при запуске `docker compose up -d --build` (а также поддерживаются через `/docker-entrypoint-initdb.d` PostgreSQL).
 
 Публикация action manifests выполняется через `cli`:
 

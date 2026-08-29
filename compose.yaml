@@ -5,6 +5,16 @@ services:
       dockerfile: src/Gateway/Dockerfile
     ports:
       - "8080:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
     environment:
       ASPNETCORE_URLS: http://+:8080
       API_BACKEND_URL: http://api:8080
@@ -12,18 +22,55 @@ services:
       api:
         condition: service_started
     networks:
-      - course-net
+      - gateway-net
 
   api:
     build:
       context: .
       dockerfile: src/Api/Dockerfile
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
     environment:
       ASPNETCORE_URLS: http://+:8080
       COURSE_JWT_ISSUER: moduledev-course
       COURSE_JWT_AUDIENCE: moduledev-api
-      COURSE_JWT_SIGNING_KEY: ThisIsALocalDevSigningKeyAtLeast32Bytes!
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=runtime_pass;MaxPoolSize=80"
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=${RUNTIME_PASSWORD};MaxPoolSize=80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    networks:
+      - gateway-net
+      - course-net
+
+  migrator:
+    build:
+      context: .
+      dockerfile: src/Cli/Dockerfile
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    environment:
+      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=postgres;Password=${POSTGRES_PASSWORD}"
+      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD}
+      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD}
+      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD}
+    volumes:
+      - ./migrations:/migrations:ro
+    command: ["migration", "apply", "/migrations"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,8 +81,15 @@ services:
     build:
       context: .
       dockerfile: src/Cli/Dockerfile
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
     environment:
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_publication;Password=publication_pass"
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_publication;Password=${PUBLICATION_PASSWORD}"
+      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_migration;Password=${MIGRATION_PASSWORD}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,14 +97,13 @@ services:
       - course-net
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: course
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - course-data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
       interval: 2s
@@ -64,3 +117,4 @@ volumes:
 
 networks:
   course-net:
+  gateway-net:

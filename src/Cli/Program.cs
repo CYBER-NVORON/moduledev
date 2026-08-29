@@ -5,67 +5,9 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Json.Schema;
 using Npgsql;
+using Cli;
 
 var jsonOpts = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = null };
-
-var ManifestSchema = JsonSchema.FromText("""
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:course:course-1:action-manifest",
-  "title": "Course action manifest",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "contract_version","module","action","version","http_method",
-    "target_schema","target_function","request_schema","response_schema",
-    "outcomes","required_policy","idempotency_mode","idempotency_scope",
-    "timeout_ms","enabled","is_default"
-  ],
-  "properties": {
-    "contract_version": {"const": "course-1"},
-    "module": {"$ref": "#/$defs/sqlIdentifier"},
-    "action": {"$ref": "#/$defs/sqlIdentifier"},
-    "version": {"type": "integer", "minimum": 1},
-    "http_method": {"const": "POST"},
-    "target_schema": {"$ref": "#/$defs/sqlIdentifier"},
-    "target_function": {"$ref": "#/$defs/sqlIdentifier"},
-    "request_schema": {"$ref": "#/$defs/schemaDocument"},
-    "response_schema": {"$ref": "#/$defs/schemaDocument"},
-    "outcomes": {
-      "type": "array","minItems": 1,"uniqueItems": true,
-      "items": {"$ref": "#/$defs/outcome"}
-    },
-    "required_policy": {
-      "type": "array","uniqueItems": true,
-      "items": {"type": "string","pattern": "^[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*$"}
-    },
-    "idempotency_mode": {"enum": ["none","optional","required"]},
-    "idempotency_scope": {"enum": ["none","principal_action","consumer_action","global_action"]},
-    "timeout_ms": {"type": "integer","minimum": 1,"maximum": 30000},
-    "enabled": {"type": "boolean"},
-    "is_default": {"type": "boolean"}
-  },
-  "allOf": [
-    {
-      "if": {"properties": {"idempotency_mode": {"const": "none"}},"required": ["idempotency_mode"]},
-      "then": {"properties": {"idempotency_scope": {"const": "none"}}},
-      "else": {"properties": {"idempotency_scope": {"enum": ["principal_action","consumer_action","global_action"]}}}
-    },
-    {
-      "if": {"properties": {"is_default": {"const": true}},"required": ["is_default"]},
-      "then": {"properties": {"enabled": {"const": true}}}
-    }
-  ],
-  "$defs": {
-    "sqlIdentifier": {"type": "string","pattern": "^[a-z][a-z0-9_]{0,62}$"},
-    "outcome": {"type": "string","pattern": "^[A-Z][A-Z0-9_]{0,62}$"},
-    "schemaDocument": {
-      "type": "object","required": ["$schema"],
-      "properties": {"$schema": {"const": "https://json-schema.org/draft/2020-12/schema"}}
-    }
-  }
-}
-""");
 
 try
 {
@@ -91,16 +33,21 @@ async Task<int> Run(string[] args)
                      ?? Environment.GetEnvironmentVariable("POSTGRES_CONNECTION_STRING")
                      ?? throw new InvalidOperationException("COURSE_DB_CONNECTION not set");
 
-    return (args[0], args.ElementAtOrDefault(1)) switch
+    string GetMigrationConn() => Environment.GetEnvironmentVariable("COURSE_MIGRATION_DB_CONNECTION")
+                              ?? GetConn();
+
+    switch (args[0], args.ElementAtOrDefault(1))
     {
-        ("migration", "apply") when args.Length >= 3 => await MigrationApply(GetConn(), args[2]),
-        ("action", "validate") when args.Length >= 3 => ActionValidate(args[2]),
-        ("action", "publish") when args.Length >= 3 => await ActionPublish(GetConn(), args[2]),
-        ("action", "list") => await ActionList(GetConn()),
-        ("action", "activate") when args.Length >= 4 => await ActionActivate(GetConn(), args),
-        ("action", "disable") when args.Length >= 4 => await ActionDisable(GetConn(), args),
-        _ => Fail("request.invalid", $"unknown command: {string.Join(' ', args)}")
-    };
+        case ("migration", "apply") when args.Length >= 3: return await MigrationApply(GetMigrationConn(), args[2]);
+        case ("action", "validate") when args.Length >= 3: return ActionValidate(args[2]);
+        case ("action", "publish") when args.Length >= 3: return await ActionPublish(GetConn(), args[2]);
+        case ("action", "list"): return await ActionList(GetConn());
+        case ("action", "activate") when args.Length >= 4: return await ActionActivate(GetConn(), args);
+        case ("action", "disable") when args.Length >= 4: return await ActionDisable(GetConn(), args);
+        default:
+            WriteEnvelope(Error("request.invalid", $"unknown command: {string.Join(' ', args)}"));
+            return 1;
+    }
 }
 
 // --- Migration Apply ---
@@ -125,15 +72,24 @@ async Task<int> MigrationApply(string connStr, string directory)
     foreach (var file in files)
     {
         var filename = Path.GetFileName(file)!;
-        var content = await File.ReadAllTextAsync(file);
-        var normalized = content.Replace("\r\n", "\n");
-        var hash = Sha256Hex(normalized);
+        var rawContent = await File.ReadAllTextAsync(file);
+        
+        var normalizedTemplate = rawContent.Replace("\r\n", "\n");
+        var hash = CliHelpers.Sha256Hex(normalizedTemplate);
 
         // Check if already applied
-        await using var checkCmd = new NpgsqlCommand(
-            "SELECT checksum_sha256 FROM catalog.migrations WHERE filename = @f", conn);
-        checkCmd.Parameters.AddWithValue("f", filename);
-        var existing = await checkCmd.ExecuteScalarAsync() as string;
+        string? existing = null;
+        try
+        {
+            await using var checkCmd = new NpgsqlCommand(
+                "SELECT checksum_sha256 FROM catalog.migrations WHERE filename = @f", conn);
+            checkCmd.Parameters.AddWithValue("f", filename);
+            existing = await checkCmd.ExecuteScalarAsync() as string;
+        }
+        catch (PostgresException ex) when (ex.SqlState == "42P01")
+        {
+            // Table doesn't exist yet, which is expected for the first migration
+        }
 
         if (existing is not null)
         {
@@ -151,7 +107,19 @@ async Task<int> MigrationApply(string connStr, string directory)
         await using var tx = await conn.BeginTransactionAsync();
         try
         {
-            await using var execCmd = new NpgsqlCommand(content, conn, tx);
+            // Безопасно инжектим пароли в текущую сессию транзакции
+            await using var setCmd = new NpgsqlCommand(@"
+                SELECT set_config('course.runtime_pwd', @rt, true),
+                       set_config('course.publication_pwd', @pub, true),
+                       set_config('course.migration_pwd', @mig, true)
+            ", conn, tx);
+            setCmd.Parameters.AddWithValue("rt", Environment.GetEnvironmentVariable("RUNTIME_PASSWORD") ?? "runtime_pass");
+            setCmd.Parameters.AddWithValue("pub", Environment.GetEnvironmentVariable("PUBLICATION_PASSWORD") ?? "publication_pass");
+            setCmd.Parameters.AddWithValue("mig", Environment.GetEnvironmentVariable("MIGRATION_PASSWORD") ?? "migration_pass");
+            await setCmd.ExecuteNonQueryAsync();
+
+            // Выполняем ОРИГИНАЛЬНЫЙ rawContent, без всяких Replace!
+            await using var execCmd = new NpgsqlCommand(rawContent, conn, tx);
             execCmd.CommandTimeout = 120;
             await execCmd.ExecuteNonQueryAsync();
 
@@ -191,7 +159,7 @@ int ActionValidate(string manifestPath)
         return 1;
     }
 
-    var (valid, message, manifest) = ValidateManifest(manifestPath);
+    var (valid, message, manifest) = CliHelpers.ValidateManifest(manifestPath);
     if (!valid)
     {
         WriteEnvelope(Error("manifest.invalid", message));
@@ -219,7 +187,7 @@ async Task<int> ActionPublish(string connStr, string manifestPath)
         return 1;
     }
 
-    var (valid, message, manifest) = ValidateManifest(manifestPath);
+    var (valid, message, manifest) = CliHelpers.ValidateManifest(manifestPath);
     if (!valid)
     {
         WriteEnvelope(Error("manifest.invalid", message));
@@ -231,7 +199,10 @@ async Task<int> ActionPublish(string connStr, string manifestPath)
     var action = (string)m["action"]!;
     var version = (int)m["version"]!;
     var manifestText = File.ReadAllText(manifestPath);
-    var hash = Sha256Hex(manifestText);
+    var hash = CliHelpers.Sha256Hex(manifestText);
+
+    var targetSchema = (string)m["target_schema"]!;
+    var targetFunction = (string)m["target_function"]!;
 
     await using var conn = new NpgsqlConnection(connStr);
     await conn.OpenAsync();
@@ -239,20 +210,31 @@ async Task<int> ActionPublish(string connStr, string manifestPath)
 
     try
     {
-        // Insert-or-ignore plus a read in one transaction makes concurrent identical
-        // publishes converge on the immutable catalog row.
+        await using var sigCmd = new NpgsqlCommand(
+            "SELECT proretset FROM pg_proc JOIN pg_namespace n ON n.oid = pronamespace WHERE proname = @fn AND n.nspname = @sn", conn, tx);
+        sigCmd.Parameters.AddWithValue("fn", targetFunction);
+        sigCmd.Parameters.AddWithValue("sn", targetSchema);
+        var isSet = await sigCmd.ExecuteScalarAsync();
+        
+        if (isSet is null) {
+            await tx.RollbackAsync();
+            WriteEnvelope(Error("manifest.invalid", $"target function {targetSchema}.{targetFunction} not found"));
+            return 1;
+        }
+        if ((bool)isSet) {
+            await tx.RollbackAsync();
+            WriteEnvelope(Error("manifest.invalid", $"target function {targetSchema}.{targetFunction} has invalid signature (set-returning)"));
+            return 1;
+        }
+
+        // Call encapsulated PostgreSQL routine
         await using var insertCmd = new NpgsqlCommand(@"
-            INSERT INTO catalog.actions
-                (module, action, version, manifest_json, manifest_hash,
-                 target_schema, target_function, http_method, outcomes,
-                 required_policy, idempotency_mode, idempotency_scope,
-                 timeout_ms, enabled, is_default)
-            VALUES
-                (@module, @action, @version, @manifest_json::jsonb, @manifest_hash,
-                 @target_schema, @target_function, @http_method, @outcomes::jsonb,
-                 @required_policy::jsonb, @idempotency_mode, @idempotency_scope,
-                 @timeout_ms, @enabled, @is_default)
-            ON CONFLICT (module, action, version) DO NOTHING", conn, tx);
+            SELECT catalog.publish_action(
+                @module, @action, @version, @manifest_json::jsonb, @manifest_hash,
+                @target_schema, @target_function, @http_method, @outcomes::jsonb,
+                @required_policy::jsonb, @idempotency_mode, @idempotency_scope,
+                @timeout_ms
+            )", conn, tx);
 
         insertCmd.Parameters.AddWithValue("module", module);
         insertCmd.Parameters.AddWithValue("action", action);
@@ -267,8 +249,6 @@ async Task<int> ActionPublish(string connStr, string manifestPath)
         insertCmd.Parameters.AddWithValue("idempotency_mode", (string)m["idempotency_mode"]!);
         insertCmd.Parameters.AddWithValue("idempotency_scope", (string)m["idempotency_scope"]!);
         insertCmd.Parameters.AddWithValue("timeout_ms", (int)m["timeout_ms"]!);
-        insertCmd.Parameters.AddWithValue("enabled", (bool)m["enabled"]!);
-        insertCmd.Parameters.AddWithValue("is_default", (bool)m["is_default"]!);
         await insertCmd.ExecuteNonQueryAsync();
 
         await using var checkCmd = new NpgsqlCommand(
@@ -346,7 +326,7 @@ async Task<int> ActionActivate(string connStr, string[] args)
 {
     var (module, action) = ParseRouteKey(args[2]);
     var version = ParseNamedArg(args, "--version");
-    if (module is null || version is null)
+    if (module is null || action is null || version is null)
     {
         WriteEnvelope(Error("request.invalid", "usage: action activate <module.action> --version <v>"));
         return 1;
@@ -361,33 +341,21 @@ async Task<int> ActionActivate(string connStr, string[] args)
     await conn.OpenAsync();
     await using var tx = await conn.BeginTransactionAsync();
 
-    // Check version exists
-    await using var checkCmd = new NpgsqlCommand(
-        "SELECT 1 FROM catalog.actions WHERE module=@m AND action=@a AND version=@v", conn, tx);
-    checkCmd.Parameters.AddWithValue("m", module);
-    checkCmd.Parameters.AddWithValue("a", action);
-    checkCmd.Parameters.AddWithValue("v", ver);
-    if (await checkCmd.ExecuteScalarAsync() is null)
+    try
+    {
+        await using var setCmd = new NpgsqlCommand(
+            "SELECT catalog.activate_action(@m, @a, @v)", conn, tx);
+        setCmd.Parameters.AddWithValue("m", module);
+        setCmd.Parameters.AddWithValue("a", action);
+        setCmd.Parameters.AddWithValue("v", ver);
+        await setCmd.ExecuteNonQueryAsync();
+    }
+    catch (PostgresException ex) when (ex.MessageText == "action.not_found")
     {
         await tx.RollbackAsync();
         WriteEnvelope(Error("action.not_found", $"action {module}.{action} v{ver} not found"));
         return 1;
     }
-
-    // Clear is_default for all versions of this route
-    await using var clearCmd = new NpgsqlCommand(
-        "UPDATE catalog.actions SET is_default = false WHERE module=@m AND action=@a", conn, tx);
-    clearCmd.Parameters.AddWithValue("m", module);
-    clearCmd.Parameters.AddWithValue("a", action);
-    await clearCmd.ExecuteNonQueryAsync();
-
-    // Set target version as enabled + default
-    await using var setCmd = new NpgsqlCommand(
-        "UPDATE catalog.actions SET enabled = true, is_default = true WHERE module=@m AND action=@a AND version=@v", conn, tx);
-    setCmd.Parameters.AddWithValue("m", module);
-    setCmd.Parameters.AddWithValue("a", action);
-    setCmd.Parameters.AddWithValue("v", ver);
-    await setCmd.ExecuteNonQueryAsync();
 
     await tx.CommitAsync();
 
@@ -409,7 +377,7 @@ async Task<int> ActionDisable(string connStr, string[] args)
     var version = ParseNamedArg(args, "--version");
     var replacement = ParseNamedArg(args, "--replacement-version");
 
-    if (module is null || version is null)
+    if (module is null || action is null || version is null)
     {
         WriteEnvelope(Error("request.invalid", "usage: action disable <module.action> --version <v> [--replacement-version <v>]"));
         return 1;
@@ -420,117 +388,43 @@ async Task<int> ActionDisable(string connStr, string[] args)
         WriteEnvelope(Error("request.invalid", "version must be a positive integer"));
         return 1;
     }
+
+    int? repVer = null;
+    if (replacement is not null)
+    {
+        if (!TryParseVersion(replacement, out var parsedRepVer) || parsedRepVer == ver)
+        {
+            WriteEnvelope(Error("request.invalid", "replacement version must be a different positive integer"));
+            return 1;
+        }
+        repVer = parsedRepVer;
+    }
+
     await using var conn = new NpgsqlConnection(connStr);
     await conn.OpenAsync();
     await using var tx = await conn.BeginTransactionAsync();
 
-    // Check if this version exists and is the default.
-    await using var checkCmd = new NpgsqlCommand(
-        "SELECT enabled, is_default FROM catalog.actions WHERE module=@m AND action=@a AND version=@v", conn, tx);
-    checkCmd.Parameters.AddWithValue("m", module);
-    checkCmd.Parameters.AddWithValue("a", action);
-    checkCmd.Parameters.AddWithValue("v", ver);
-    await using var checkReader = await checkCmd.ExecuteReaderAsync();
-
-    if (!await checkReader.ReadAsync())
+    try
     {
-        await checkReader.DisposeAsync();
+        await using var disableCmd = new NpgsqlCommand(
+            "SELECT catalog.disable_action(@m, @a, @v, @rep)", conn, tx);
+        disableCmd.Parameters.AddWithValue("m", module);
+        disableCmd.Parameters.AddWithValue("a", action);
+        disableCmd.Parameters.AddWithValue("v", ver);
+        disableCmd.Parameters.AddWithValue("rep", repVer.HasValue ? (object)repVer.Value : DBNull.Value);
+        await disableCmd.ExecuteNonQueryAsync();
+    }
+    catch (PostgresException ex) when (ex.MessageText is "action.not_found" or "manifest.conflict" or "request.invalid")
+    {
         await tx.RollbackAsync();
-        WriteEnvelope(Error("action.not_found", $"action {module}.{action} v{ver} not found"));
+        var message = ex.MessageText switch
+        {
+            "action.not_found" => $"action {module}.{action} or its replacement not found",
+            "manifest.conflict" => "disabling default version requires --replacement-version",
+            _ => "invalid replacement configuration"
+        };
+        WriteEnvelope(Error(ex.MessageText, message));
         return 1;
-    }
-
-    var wasEnabled = checkReader.GetBoolean(0);
-    var wasDefault = checkReader.GetBoolean(1);
-    await checkReader.DisposeAsync();
-
-    if (wasDefault && replacement is null)
-    {
-        await tx.RollbackAsync();
-        WriteEnvelope(Error("manifest.conflict",
-            "disabling default version requires --replacement-version"));
-        return 1;
-    }
-
-    if (replacement is not null)
-    {
-        if (!wasDefault)
-        {
-            await tx.RollbackAsync();
-            WriteEnvelope(Error("request.invalid", "replacement version is only valid when disabling the default version"));
-            return 1;
-        }
-
-        if (!TryParseVersion(replacement, out var repVer) || repVer == ver)
-        {
-            await tx.RollbackAsync();
-            WriteEnvelope(Error("request.invalid", "replacement version must be a different positive integer"));
-            return 1;
-        }
-
-        await using var repCheckCmd = new NpgsqlCommand(
-            "SELECT enabled FROM catalog.actions WHERE module=@m AND action=@a AND version=@v", conn, tx);
-        repCheckCmd.Parameters.AddWithValue("m", module);
-        repCheckCmd.Parameters.AddWithValue("a", action);
-        repCheckCmd.Parameters.AddWithValue("v", repVer);
-        var replacementEnabled = await repCheckCmd.ExecuteScalarAsync();
-        if (replacementEnabled is null)
-        {
-            await tx.RollbackAsync();
-            WriteEnvelope(Error("action.not_found",
-                $"replacement version {module}.{action} v{repVer} not found"));
-            return 1;
-        }
-
-        if (!(bool)replacementEnabled)
-        {
-            await tx.RollbackAsync();
-            WriteEnvelope(Error("request.invalid",
-                $"replacement version {module}.{action} v{repVer} is disabled"));
-            return 1;
-        }
-    }
-
-    // A disabled version is already in the requested state; keep the command idempotent.
-    if (!wasEnabled)
-    {
-        await tx.RollbackAsync();
-        WriteEnvelope(Ok(new JsonObject
-        {
-            ["resource"] = "action",
-            ["operation"] = "disabled",
-            ["key"] = $"{module}.{action}",
-            ["version"] = ver
-        }));
-        return 0;
-    }
-
-    // Disable the target version
-    await using var disableCmd = new NpgsqlCommand(
-        "UPDATE catalog.actions SET enabled = false, is_default = false WHERE module=@m AND action=@a AND version=@v", conn, tx);
-    disableCmd.Parameters.AddWithValue("m", module);
-    disableCmd.Parameters.AddWithValue("a", action);
-    disableCmd.Parameters.AddWithValue("v", ver);
-    await disableCmd.ExecuteNonQueryAsync();
-
-    // If replacement specified, activate it.
-    if (replacement is not null)
-    {
-        TryParseVersion(replacement, out var repVer);
-
-        // Clear all defaults, then set replacement as enabled + default
-        await using var clearCmd = new NpgsqlCommand(
-            "UPDATE catalog.actions SET is_default = false WHERE module=@m AND action=@a", conn, tx);
-        clearCmd.Parameters.AddWithValue("m", module);
-        clearCmd.Parameters.AddWithValue("a", action);
-        await clearCmd.ExecuteNonQueryAsync();
-
-        await using var repCmd = new NpgsqlCommand(
-            "UPDATE catalog.actions SET enabled = true, is_default = true WHERE module=@m AND action=@a AND version=@v", conn, tx);
-        repCmd.Parameters.AddWithValue("m", module);
-        repCmd.Parameters.AddWithValue("a", action);
-        repCmd.Parameters.AddWithValue("v", repVer);
-        await repCmd.ExecuteNonQueryAsync();
     }
 
     await tx.CommitAsync();
@@ -549,8 +443,8 @@ async Task<int> ActionDisable(string connStr, string[] args)
 
 (string? module, string? action) ParseRouteKey(string key)
 {
-    var dot = key.IndexOf('.');
-    return dot > 0 ? (key[..dot], key[(dot + 1)..]) : (null, null);
+    var p = key.Split('.', 2);
+    return p.Length == 2 ? (p[0], p[1]) : (null, null);
 }
 
 string? ParseNamedArg(string[] args, string name)
@@ -567,41 +461,6 @@ bool TryParseVersion(string? value, out int version)
         && version > 0;
 }
 
-(bool valid, string message, JsonNode? manifest) ValidateManifest(string path)
-{
-    string text;
-    try { text = File.ReadAllText(path); }
-    catch (Exception ex) { return (false, ex.Message, null); }
-
-    JsonNode? node;
-    try { node = JsonNode.Parse(text); }
-    catch (JsonException ex) { return (false, $"invalid JSON: {ex.Message}", null); }
-
-    if (node is null) return (false, "empty JSON document", null);
-
-    var result = ManifestSchema.Evaluate(node, new EvaluationOptions
-    {
-        OutputFormat = OutputFormat.List
-    });
-
-    if (!result.IsValid)
-    {
-        var errors = result.Details?
-            .Where(d => d.Errors is not null)
-            .SelectMany(d => d.Errors!)
-            .Select(e => $"{e.Key}: {e.Value}")
-            .ToList() ?? [];
-        return (false, string.Join("; ", errors.Take(5)), null);
-    }
-
-    return (true, "valid", node);
-}
-
-string Sha256Hex(string content)
-{
-    var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(content));
-    return Convert.ToHexString(bytes).ToLowerInvariant();
-}
 
 // --- Envelope ---
 
@@ -623,8 +482,4 @@ JsonObject Error(string code, string message) => new()
     ["meta"] = new JsonObject { ["contractVersion"] = "course-1" }
 };
 
-int Fail(string code, string msg)
-{
-    WriteEnvelope(Error(code, msg));
-    return 1;
-}
+
