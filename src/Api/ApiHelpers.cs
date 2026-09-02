@@ -14,8 +14,7 @@ public static class ApiHelpers
     public static bool IsTransientDatabaseError(Exception ex) => ex switch
     {
         PostgresException => false,
-        NpgsqlException npgsql => npgsql.InnerException is System.Net.Sockets.SocketException
-            or System.IO.IOException or TimeoutException,
+        NpgsqlException npgsql => npgsql.IsTransient,
         System.Net.Sockets.SocketException or System.IO.IOException or TimeoutException => true,
         _ when ex.InnerException is not null => IsTransientDatabaseError(ex.InnerException),
         _ => false

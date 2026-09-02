@@ -14,27 +14,28 @@ ALTER VIEW autocheck.action_dispatches OWNER TO course_owner;
 GRANT SELECT ON autocheck.action_dispatches TO course_runtime, course_publication;
 -- Removed DML grants for course_runtime on autocheck schema
 
-CREATE OR REPLACE FUNCTION catalog.trg_actions_immutable()
-RETURNS TRIGGER AS $$
+CREATE OR REPLACE FUNCTION catalog.check_action_immutability()
+RETURNS trigger AS $$
 BEGIN
-    IF NEW.module IS DISTINCT FROM OLD.module OR
-       NEW.action IS DISTINCT FROM OLD.action OR
-       NEW.version IS DISTINCT FROM OLD.version OR
-       NEW.manifest_json::text IS DISTINCT FROM OLD.manifest_json::text OR
-       NEW.manifest_hash IS DISTINCT FROM OLD.manifest_hash OR
-       NEW.target_schema IS DISTINCT FROM OLD.target_schema OR
-       NEW.target_function IS DISTINCT FROM OLD.target_function OR
-       NEW.outcomes IS DISTINCT FROM OLD.outcomes THEN
-        RAISE EXCEPTION 'Cannot modify immutable fields of catalog.actions';
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'actions cannot be deleted' USING ERRCODE = 'data_exception';
+    END IF;
+
+    IF OLD.module <> NEW.module OR OLD.action <> NEW.action OR OLD.version <> NEW.version OR
+       OLD.manifest_json <> NEW.manifest_json OR OLD.manifest_hash <> NEW.manifest_hash OR
+       OLD.target_schema <> NEW.target_schema OR OLD.target_function <> NEW.target_function OR
+       OLD.outcomes <> NEW.outcomes OR OLD.http_method <> NEW.http_method OR
+       OLD.required_policy <> NEW.required_policy OR OLD.idempotency_mode <> NEW.idempotency_mode OR
+       OLD.idempotency_scope <> NEW.idempotency_scope OR OLD.timeout_ms <> NEW.timeout_ms THEN
+        RAISE EXCEPTION 'action signature and payload are immutable' USING ERRCODE = 'data_exception';
     END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_actions_immutable
-BEFORE UPDATE ON catalog.actions
-FOR EACH ROW
-EXECUTE FUNCTION catalog.trg_actions_immutable();
+CREATE TRIGGER enforce_action_immutability
+BEFORE UPDATE OR DELETE ON catalog.actions
+FOR EACH ROW EXECUTE FUNCTION catalog.check_action_immutability();
 
 -- Publish
 CREATE OR REPLACE FUNCTION catalog.publish_action(
@@ -62,7 +63,7 @@ BEGIN
         COALESCE((p_manifest_json->>'is_default')::boolean, false)
     ) ON CONFLICT (module, action, version) DO NOTHING;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- Activate
 CREATE OR REPLACE FUNCTION catalog.activate_action(
@@ -82,7 +83,7 @@ BEGIN
     UPDATE catalog.actions SET enabled = true, is_default = true
     WHERE module = p_module AND action = p_action AND version = p_version;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- Disable
 CREATE OR REPLACE FUNCTION catalog.disable_action(
@@ -146,7 +147,7 @@ BEGIN
         WHERE module = p_module AND action = p_action AND version = p_replacement;
     END IF;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA catalog TO course_publication;
 
 -- Helper to check replay before schema validation
@@ -231,5 +232,5 @@ BEGIN
     
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, api, catalog, idempotency, public;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, api, catalog, idempotency, pg_temp;
 GRANT EXECUTE ON FUNCTION api.check_replay(text, text, jsonb, jsonb) TO course_runtime;

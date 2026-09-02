@@ -42,13 +42,11 @@ services:
       ASPNETCORE_URLS: http://+:8080
       COURSE_JWT_ISSUER: moduledev-course
       COURSE_JWT_AUDIENCE: moduledev-api
-      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY}
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=${RUNTIME_PASSWORD};MaxPoolSize=80"
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-ThisIsALocalDevSigningKeyAtLeast32Bytes!}
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=${RUNTIME_PASSWORD:-runtime_pass};MaxPoolSize=80"
     depends_on:
       postgres:
         condition: service_healthy
-      migrator:
-        condition: service_completed_successfully
     networks:
       - gateway-net
       - course-net
@@ -64,12 +62,11 @@ services:
           cpus: '0.5'
           memory: 256M
     environment:
-      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=postgres;Password=${POSTGRES_PASSWORD}"
-      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD}
-      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD}
-      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD}
-    volumes:
-      - ./migrations:/migrations:ro
+      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=postgres;Password=${POSTGRES_PASSWORD:-postgres}"
+      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-runtime_pass}
+      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD:-publication_pass}
+      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD:-migration_pass}
+      WORKER_PASSWORD: ${WORKER_PASSWORD:-worker_pass}
     command: ["migration", "apply", "/migrations"]
     depends_on:
       postgres:
@@ -82,14 +79,75 @@ services:
       context: .
       dockerfile: src/Cli/Dockerfile
     read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
     deploy:
       resources:
         limits:
           cpus: '0.5'
           memory: 256M
     environment:
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_publication;Password=${PUBLICATION_PASSWORD}"
-      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_migration;Password=${MIGRATION_PASSWORD}"
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_publication;Password=${PUBLICATION_PASSWORD:-publication_pass}"
+      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_migration;Password=${MIGRATION_PASSWORD:-migration_pass}"
+      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-runtime_pass}
+      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD:-publication_pass}
+      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD:-migration_pass}
+      WORKER_PASSWORD: ${WORKER_PASSWORD:-worker_pass}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-ThisIsALocalDevSigningKeyAtLeast32Bytes!}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - course-net
+
+  worker-a:
+    image: course-worker:latest
+    build:
+      context: .
+      dockerfile: src/Worker/Dockerfile
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    environment:
+      COURSE_WORKER_OWNER: worker-a
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${WORKER_PASSWORD:-worker_pass}"
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-}"
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - course-net
+
+  worker-b:
+    image: course-worker:latest
+    build:
+      context: .
+      dockerfile: src/Worker/Dockerfile
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    environment:
+      COURSE_WORKER_OWNER: worker-b
+      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${WORKER_PASSWORD:-worker_pass}"
+      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-}"
+      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -97,11 +155,17 @@ services:
       - course-net
 
   postgres:
-    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    build:
+      context: .
+      dockerfile: src/Postgres/Dockerfile
     environment:
       POSTGRES_DB: course
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-runtime_pass}
+      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD:-publication_pass}
+      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD:-migration_pass}
+      WORKER_PASSWORD: ${WORKER_PASSWORD:-worker_pass}
     volumes:
       - course-data:/var/lib/postgresql/data
     healthcheck:

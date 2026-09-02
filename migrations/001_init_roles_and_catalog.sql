@@ -1,14 +1,9 @@
 -- 001_init_roles_and_catalog.sql
--- Phase 1: Roles, schemas, core tables, catalog, idempotency, payment
 
 -- ============================================================
 -- 1. ROLES (idempotent with IF NOT EXISTS)
 -- ============================================================
 DO $$
-DECLARE
-    rt_pass text := current_setting('course.runtime_pwd', true);
-    pub_pass text := current_setting('course.publication_pwd', true);
-    mig_pass text := current_setting('course.migration_pwd', true);
 BEGIN
   -- Создаем роли без паролей (или не трогаем, если есть)
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'course_owner') THEN
@@ -23,22 +18,11 @@ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'course_migration') THEN
     CREATE ROLE course_migration LOGIN;
   END IF;
-
-  -- Безопасно обновляем пароли, если они были переданы в сессию
-  IF rt_pass IS NOT NULL AND rt_pass <> '' THEN
-      EXECUTE format('ALTER ROLE course_runtime WITH PASSWORD %L', rt_pass);
-  END IF;
-  IF pub_pass IS NOT NULL AND pub_pass <> '' THEN
-      EXECUTE format('ALTER ROLE course_publication WITH PASSWORD %L', pub_pass);
-  END IF;
-  IF mig_pass IS NOT NULL AND mig_pass <> '' THEN
-      EXECUTE format('ALTER ROLE course_migration WITH PASSWORD %L', mig_pass);
-  END IF;
 END $$;
 
 GRANT ALL ON DATABASE course TO course_owner;
 
-GRANT ALL ON DATABASE course TO course_publication;
+GRANT CONNECT, TEMPORARY ON DATABASE course TO course_publication;
 
 GRANT CONNECT, TEMPORARY ON DATABASE course TO course_runtime;
 
@@ -301,7 +285,7 @@ BEGIN
         END IF;
     END LOOP;
 END;
-$$;
+$$ SET search_path = pg_catalog, pg_temp;
 
 ALTER FUNCTION catalog.trg_set_object_owner() OWNER TO postgres;
 

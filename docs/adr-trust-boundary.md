@@ -38,6 +38,7 @@ Api не публикует host-порты. Доступ к Api возможе�
 | `course_runtime`    | `LOGIN`. Выполняет `api.invoke`. Нет прямого DML к `payment.*`.|
 | `course_publication`| `LOGIN`. Ограниченная публикация манифестов в `catalog.*`. Без owner-прав и без доступа к `payment.*`. |
 | `course_migration`  | `LOGIN`. Выполнение DDL-миграций структуры схемы (admin).      |
+| `workflow_worker`   | `LOGIN`. Выполняет `workflow.claim_jobs`, `api.invoke`, `workflow.finish_job`, `workflow.fail_job`. Нет прямого DML к `payment.*` и `workflow.*`. |
 
 `course_runtime` не может напрямую INSERT/UPDATE/DELETE в `payment.operations` или `payment.operation_events` — только через `SECURITY DEFINER` функции, принадлежащие `course_owner`. `payment.operations` защищена триггерами неизменяемости и графом допустимых переходов статусов, а `payment.operation_events` является строго append-only.
 

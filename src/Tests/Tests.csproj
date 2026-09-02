@@ -24,6 +24,7 @@
     <ProjectReference Include="..\Api\Api.csproj" />
     <ProjectReference Include="..\Cli\Cli.csproj" />
     <ProjectReference Include="..\Gateway\Gateway.csproj" />
+    <ProjectReference Include="..\Worker\Worker.csproj" />
   </ItemGroup>
 
 </Project>

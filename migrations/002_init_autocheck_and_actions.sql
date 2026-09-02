@@ -1,5 +1,4 @@
 -- 002_init_autocheck_and_actions.sql
--- Phase 1: autocheck views, api.invoke, payment.request_v1, operation.get_v1, catalog registration
 
 CREATE SCHEMA IF NOT EXISTS operation AUTHORIZATION course_owner;
 
@@ -60,7 +59,7 @@ CREATE OR REPLACE FUNCTION api.invoke(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, api, catalog, idempotency, public
+SET search_path = pg_catalog, api, catalog, idempotency, pg_temp
 AS $$
 DECLARE
     v_rec           catalog.actions%ROWTYPE;
@@ -368,7 +367,7 @@ CREATE OR REPLACE FUNCTION payment.request_v1(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, payment, idempotency, public
+SET search_path = pg_catalog, payment, idempotency, pg_temp
 AS $$
 DECLARE
     v_request_id     text;
@@ -423,7 +422,7 @@ CREATE OR REPLACE FUNCTION operation.get_v1(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, payment, public
+SET search_path = pg_catalog, payment, pg_temp
 AS $$
 DECLARE
     v_op payment.operations%ROWTYPE;

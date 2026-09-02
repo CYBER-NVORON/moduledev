@@ -44,6 +44,14 @@ async Task<int> Run(string[] args)
         case ("action", "list"): return await ActionList(GetConn());
         case ("action", "activate") when args.Length >= 4: return await ActionActivate(GetConn(), args);
         case ("action", "disable") when args.Length >= 4: return await ActionDisable(GetConn(), args);
+        case ("flow", "validate") when args.Length >= 3: return await FlowCommands.FlowValidate(GetConn(), args[2]);
+        case ("flow", "publish") when args.Length >= 3: return await FlowCommands.FlowPublish(GetConn(), args[2]);
+        case ("flow", "list"): return await FlowCommands.FlowList(GetConn());
+        case ("flow", "activate") when args.Length >= 4: return await FlowCommands.FlowActivate(GetConn(), args);
+        case ("flow", "start") when args.Length >= 3: return await FlowCommands.FlowStart(GetConn(), args);
+        case ("flow", "get") when args.Length >= 3: return await FlowCommands.FlowGet(GetConn(), args[2]);
+        case ("flow", "signal") when args.Length >= 3: return await FlowCommands.FlowSignal(GetConn(), args);
+        case ("flow", "test-finish") when args.Length >= 3: return await FlowCommands.FlowTestFinish(GetConn(), args);
         default:
             WriteEnvelope(Error("request.invalid", $"unknown command: {string.Join(' ', args)}"));
             return 1;
@@ -111,11 +119,13 @@ async Task<int> MigrationApply(string connStr, string directory)
             await using var setCmd = new NpgsqlCommand(@"
                 SELECT set_config('course.runtime_pwd', @rt, true),
                        set_config('course.publication_pwd', @pub, true),
-                       set_config('course.migration_pwd', @mig, true)
+                       set_config('course.migration_pwd', @mig, true),
+                       set_config('course.worker_pwd', @wkr, true)
             ", conn, tx);
-            setCmd.Parameters.AddWithValue("rt", Environment.GetEnvironmentVariable("RUNTIME_PASSWORD") ?? "runtime_pass");
-            setCmd.Parameters.AddWithValue("pub", Environment.GetEnvironmentVariable("PUBLICATION_PASSWORD") ?? "publication_pass");
-            setCmd.Parameters.AddWithValue("mig", Environment.GetEnvironmentVariable("MIGRATION_PASSWORD") ?? "migration_pass");
+            setCmd.Parameters.AddWithValue("rt", Environment.GetEnvironmentVariable("RUNTIME_PASSWORD") ?? throw new InvalidOperationException("RUNTIME_PASSWORD not set"));
+            setCmd.Parameters.AddWithValue("pub", Environment.GetEnvironmentVariable("PUBLICATION_PASSWORD") ?? throw new InvalidOperationException("PUBLICATION_PASSWORD not set"));
+            setCmd.Parameters.AddWithValue("mig", Environment.GetEnvironmentVariable("MIGRATION_PASSWORD") ?? throw new InvalidOperationException("MIGRATION_PASSWORD not set"));
+            setCmd.Parameters.AddWithValue("wkr", Environment.GetEnvironmentVariable("WORKER_PASSWORD") ?? throw new InvalidOperationException("WORKER_PASSWORD not set"));
             await setCmd.ExecuteNonQueryAsync();
 
             // Выполняем ОРИГИНАЛЬНЫЙ rawContent, без всяких Replace!

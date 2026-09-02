@@ -19,10 +19,10 @@ builder.WebHost.ConfigureKestrel(k => k.Limits.MaxRequestBodySize = 1_048_576); 
 // --- JSON logging to stdout, no secrets ---
 
 // --- Configuration ---
-var jwtIssuer = Env("COURSE_JWT_ISSUER");
-var jwtAudience = Env("COURSE_JWT_AUDIENCE");
-var jwtSigningKey = Env("COURSE_JWT_SIGNING_KEY");
-var dbConnection = Env("COURSE_DB_CONNECTION");
+var jwtIssuer = builder.Configuration["COURSE_JWT_ISSUER"];
+var jwtAudience = builder.Configuration["COURSE_JWT_AUDIENCE"];
+var jwtSigningKey = builder.Configuration["COURSE_JWT_SIGNING_KEY"];
+var dbConnection = builder.Configuration["COURSE_DB_CONNECTION"];
 
 var signingKeyBytes = Encoding.UTF8.GetBytes(jwtSigningKey);
 var securityKey = new SymmetricSecurityKey(signingKeyBytes);
@@ -456,7 +456,12 @@ async Task<ActionManifest?> LoadManifest(string module, string action, int? vers
         var outcomes = JsonSerializer.Deserialize<List<string>>(reader.GetString(4)) ?? new();
         var requiredPolicy = JsonSerializer.Deserialize<List<string>>(reader.GetString(5)) ?? new();
 
-        JsonSchema? GetSchema(string key) => manifestNode?[key] is JsonNode n ? SchemaCache.GetOrAdd(n.ToJsonString(), text => { if (SchemaCache.Count > 1000) SchemaCache.Clear(); return JsonSchema.FromText(text); }) : null;
+        JsonSchema? GetSchema(string key)
+        {
+            if (manifestNode?[key] is not JsonNode n) return null;
+            if (SchemaCache.Count > 1000) return JsonSchema.FromText(n.ToJsonString());
+            return SchemaCache.GetOrAdd(n.ToJsonString(), text => JsonSchema.FromText(text));
+        }
         var requestSchema = GetSchema("request_schema");
         var responseSchema = GetSchema("response_schema");
 
@@ -544,8 +549,6 @@ object ErrorEnvelope(string code, string message, string? correlationId, int? ac
     };
 }
 
-string Env(string name) => Environment.GetEnvironmentVariable(name)
-    ?? throw new InvalidOperationException($"{name} not set");
 
 
 
