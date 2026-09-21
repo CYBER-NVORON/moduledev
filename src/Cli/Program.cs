@@ -115,20 +115,6 @@ async Task<int> MigrationApply(string connStr, string directory)
         await using var tx = await conn.BeginTransactionAsync();
         try
         {
-            // Безопасно инжектим пароли в текущую сессию транзакции
-            await using var setCmd = new NpgsqlCommand(@"
-                SELECT set_config('course.runtime_pwd', @rt, true),
-                       set_config('course.publication_pwd', @pub, true),
-                       set_config('course.migration_pwd', @mig, true),
-                       set_config('course.worker_pwd', @wkr, true)
-            ", conn, tx);
-            setCmd.Parameters.AddWithValue("rt", Environment.GetEnvironmentVariable("RUNTIME_PASSWORD") ?? throw new InvalidOperationException("RUNTIME_PASSWORD not set"));
-            setCmd.Parameters.AddWithValue("pub", Environment.GetEnvironmentVariable("PUBLICATION_PASSWORD") ?? throw new InvalidOperationException("PUBLICATION_PASSWORD not set"));
-            setCmd.Parameters.AddWithValue("mig", Environment.GetEnvironmentVariable("MIGRATION_PASSWORD") ?? throw new InvalidOperationException("MIGRATION_PASSWORD not set"));
-            setCmd.Parameters.AddWithValue("wkr", Environment.GetEnvironmentVariable("WORKER_PASSWORD") ?? throw new InvalidOperationException("WORKER_PASSWORD not set"));
-            await setCmd.ExecuteNonQueryAsync();
-
-            // Выполняем ОРИГИНАЛЬНЫЙ rawContent, без всяких Replace!
             await using var execCmd = new NpgsqlCommand(rawContent, conn, tx);
             execCmd.CommandTimeout = 120;
             await execCmd.ExecuteNonQueryAsync();

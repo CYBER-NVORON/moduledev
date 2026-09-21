@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\Shared\WorkflowPrincipal.cs" Link="WorkflowPrincipal.cs" />
     <PackageReference Include="Npgsql" Version="8.0.3" />
     <PackageReference Include="JsonSchema.Net" Version="7.3.1" />
     <PackageReference Include="YamlDotNet" Version="16.3.0" />

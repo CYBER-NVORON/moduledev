@@ -3,6 +3,7 @@ WORKDIR /src
 COPY src/Worker/Worker.csproj src/Worker/
 RUN dotnet restore src/Worker/Worker.csproj
 COPY src/Worker/ src/Worker/
+COPY src/Shared/ src/Shared/
 RUN dotnet publish src/Worker/Worker.csproj -c Release -o /app --no-restore
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0-alpine@sha256:c4b29bf368004ad9076c1ab9bc91fb373561e3905b4345637e14e8b8c57e3be8

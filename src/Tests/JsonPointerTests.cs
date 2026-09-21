@@ -89,6 +89,18 @@ public class JsonPointerTests
         Assert.Null(val);
     }
 
+    [Theory]
+    [InlineData("{\"value\":null}", "/value")]
+    [InlineData("{\"items\":[null]}", "/items/0")]
+    public void Mapping_PreservesExistingNull(string source, string pointer)
+    {
+        var (found, value) = JsonPointer.TryGet(JsonNode.Parse(source), pointer);
+        Assert.True(found);
+        var payload = new JsonObject();
+        JsonPointer.Set(payload, "/nested/value", value);
+        Assert.Equal("{\"nested\":{\"value\":null}}", payload.ToJsonString());
+    }
+
     [Fact]
     public void Set_SetsSimpleProperty()
     {

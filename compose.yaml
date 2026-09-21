@@ -4,12 +4,12 @@ services:
       context: .
       dockerfile: src/Gateway/Dockerfile
     ports:
-      - "8080:8080"
+    - 127.0.0.1:${COURSE_GATEWAY_PORT:-8080}:8080
     read_only: true
     cap_drop:
-      - ALL
+    - ALL
     tmpfs:
-      - /tmp
+    - /tmp
     deploy:
       resources:
         limits:
@@ -22,17 +22,16 @@ services:
       api:
         condition: service_started
     networks:
-      - gateway-net
-
+    - gateway-net
   api:
     build:
       context: .
       dockerfile: src/Api/Dockerfile
     read_only: true
     cap_drop:
-      - ALL
+    - ALL
     tmpfs:
-      - /tmp
+    - /tmp
     deploy:
       resources:
         limits:
@@ -40,68 +39,42 @@ services:
           memory: 256M
     environment:
       ASPNETCORE_URLS: http://+:8080
-      COURSE_JWT_ISSUER: moduledev-course
-      COURSE_JWT_AUDIENCE: moduledev-api
-      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-ThisIsALocalDevSigningKeyAtLeast32Bytes!}
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=${RUNTIME_PASSWORD:-runtime_pass};MaxPoolSize=80"
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
+      COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=${COURSE_RUNTIME_PASSWORD:-runtime_pass};MaxPoolSize=80
+      PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
     networks:
-      - gateway-net
-      - course-net
-
-  migrator:
-    build:
-      context: .
-      dockerfile: src/Cli/Dockerfile
-    read_only: true
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 256M
-    environment:
-      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=postgres;Password=${POSTGRES_PASSWORD:-postgres}"
-      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-runtime_pass}
-      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD:-publication_pass}
-      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD:-migration_pass}
-      WORKER_PASSWORD: ${WORKER_PASSWORD:-worker_pass}
-    command: ["migration", "apply", "/migrations"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - course-net
+    - gateway-net
+    - course-net
 
   cli:
     build:
       context: .
       dockerfile: src/Cli/Dockerfile
+    command: [migration, apply, /migrations]
     read_only: true
     cap_drop:
-      - ALL
+    - ALL
     tmpfs:
-      - /tmp
+    - /tmp
     deploy:
       resources:
         limits:
           cpus: '0.5'
           memory: 256M
     environment:
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_publication;Password=${PUBLICATION_PASSWORD:-publication_pass}"
-      COURSE_MIGRATION_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=course_migration;Password=${MIGRATION_PASSWORD:-migration_pass}"
-      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-runtime_pass}
-      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD:-publication_pass}
-      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD:-migration_pass}
-      WORKER_PASSWORD: ${WORKER_PASSWORD:-worker_pass}
-      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-ThisIsALocalDevSigningKeyAtLeast32Bytes!}
+      COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=course_publication;Password=${COURSE_PUBLISHER_PASSWORD:-publication_pass}
+      COURSE_MIGRATION_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=course_migration;Password=${COURSE_MIGRATOR_PASSWORD:-migration_pass}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
     networks:
-      - course-net
-
+    - course-net
   worker-a:
     image: course-worker:latest
     build:
@@ -109,9 +82,9 @@ services:
       dockerfile: src/Worker/Dockerfile
     read_only: true
     cap_drop:
-      - ALL
+    - ALL
     tmpfs:
-      - /tmp
+    - /tmp
     deploy:
       resources:
         limits:
@@ -119,15 +92,14 @@ services:
           memory: 256M
     environment:
       COURSE_WORKER_OWNER: worker-a
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${WORKER_PASSWORD:-worker_pass}"
-      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-}"
-      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+      COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${COURSE_WORKER_PASSWORD:-worker_pass}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
     depends_on:
       postgres:
         condition: service_healthy
     networks:
-      - course-net
-
+    - course-net
   worker-b:
     image: course-worker:latest
     build:
@@ -135,9 +107,9 @@ services:
       dockerfile: src/Worker/Dockerfile
     read_only: true
     cap_drop:
-      - ALL
+    - ALL
     tmpfs:
-      - /tmp
+    - /tmp
     deploy:
       resources:
         limits:
@@ -145,15 +117,14 @@ services:
           memory: 256M
     environment:
       COURSE_WORKER_OWNER: worker-b
-      COURSE_DB_CONNECTION: "Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${WORKER_PASSWORD:-worker_pass}"
-      COURSE_TEST_PROFILE: "${COURSE_TEST_PROFILE:-}"
-      COURSE_FAILPOINT: "${COURSE_FAILPOINT:-}"
+      COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${COURSE_WORKER_PASSWORD:-worker_pass}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
     depends_on:
       postgres:
         condition: service_healthy
     networks:
-      - course-net
-
+    - course-net
   postgres:
     build:
       context: .
@@ -161,24 +132,82 @@ services:
     environment:
       POSTGRES_DB: course
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      RUNTIME_PASSWORD: ${RUNTIME_PASSWORD:-runtime_pass}
-      PUBLICATION_PASSWORD: ${PUBLICATION_PASSWORD:-publication_pass}
-      MIGRATION_PASSWORD: ${MIGRATION_PASSWORD:-migration_pass}
-      WORKER_PASSWORD: ${WORKER_PASSWORD:-worker_pass}
+      POSTGRES_PASSWORD: ${COURSE_POSTGRES_PASSWORD:-postgres}
+      COURSE_RUNTIME_PASSWORD: ${COURSE_RUNTIME_PASSWORD:-runtime_pass}
+      COURSE_PUBLISHER_PASSWORD: ${COURSE_PUBLISHER_PASSWORD:-publication_pass}
+      COURSE_MIGRATOR_PASSWORD: ${COURSE_MIGRATOR_PASSWORD:-migration_pass}
+      COURSE_WORKER_PASSWORD: ${COURSE_WORKER_PASSWORD:-worker_pass}
+      COURSE_OUTBOX_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-outbox_pass}
+      COURSE_INBOX_PASSWORD: ${COURSE_INBOX_PASSWORD:-inbox_pass}
     volumes:
-      - course-data:/var/lib/postgresql/data
+    - course-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
       interval: 2s
       timeout: 3s
       retries: 10
     networks:
-      - course-net
-
+    - course-net
+  outbox-dispatcher:
+    build:
+      context: src/Python
+      dockerfile: Dockerfile
+    command:
+    - python
+    - src/dispatcher.py
+    environment:
+      DATABASE_URL: postgresql://outbox_dispatcher:${COURSE_OUTBOX_PASSWORD:-outbox_pass}@postgres:5432/course
+      PROVIDER_URL: ${PROVIDER_URL:-http://provider-simulator:8081}
+      OUTBOX_OWNER: ${OUTBOX_OWNER:-outbox-dispatcher}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+    - course-net
+    image: course-python:latest
+  receipt-adapter:
+    build:
+      context: src/Python
+      dockerfile: Dockerfile
+    command:
+    - python
+    - src/adapter.py
+    environment:
+      PROVIDER_CALLBACK_CAPABILITY: ${PROVIDER_CALLBACK_CAPABILITY:-}
+      PROVIDER_CALLBACK_TOKEN: ${PROVIDER_CALLBACK_TOKEN:-}
+      PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET:-}
+      RECEIPT_API_URL: ${RECEIPT_API_URL:-http://gateway:8080/api/receipt/accept}
+    networks:
+    - gateway-net
+    image: course-python:latest
+  inbox-reconciler:
+    build:
+      context: src/Python
+      dockerfile: Dockerfile
+    command:
+    - python
+    - src/reconciler.py
+    environment:
+      DATABASE_URL: postgresql://inbox_reconciler:${COURSE_INBOX_PASSWORD:-inbox_pass}@postgres:5432/course
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+    - course-net
+    image: course-python:latest
+  provider-simulator:
+    image: ghcr.io/fintech-dev-lab/internship-provider-simulator:v0.2.0@sha256:70e5e0dd9ab8425be84de431ec74516f9bedf5d5529077358e2e2b2037fe0c74
+    environment:
+      PORT: '8081'
+      CALLBACK_URL: http://receipt-adapter:8082/callbacks/provider-v02/${PROVIDER_CALLBACK_CAPABILITY:-}
+      AUDIT_TOKEN: ${PROVIDER_AUDIT_TOKEN:-}
+    networks:
+    - course-net
+    - gateway-net
 volumes:
-  course-data:
-
+  course-data: null
 networks:
-  course-net:
-  gateway-net:
+  course-net: null
+  gateway-net: null

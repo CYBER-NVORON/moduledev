@@ -8,8 +8,8 @@
 
 Action runtime возвращает два типа результатов:
 
-1. **Предметный результат** — бизнес-операция выполнена (успешно или с бизнес-ошибкой). Транзакция закоммичена или откачена в зависимости от outcome.
-2. **Инфраструктурная ошибка** — запрос не дошёл до бизнес-логики (auth, validation, timeout, DB unavailable).
+1. **Предметный результат** — action вернул `status=ok`, зарегистрированный outcome и корректный result. Отрицательное предметное решение может быть успешным outcome (например, `REJECTED`) и сохраняться с commit.
+2. **Техническая ошибка** — отказ admission либо ошибка исполнения: auth, validation, timeout, DB unavailable. Ошибка может возникнуть и после начала SQL действия; его незавершённые изменения должны откатиться.
 
 Необходимо определить единый формат HTTP-ответов для обоих случаев.
 
@@ -17,17 +17,13 @@ Action runtime возвращает два типа результатов:
 
 ### Единый JSON envelope
 
-Все ответы action runtime используют один формат:
+Успешный action использует envelope следующего вида (конкретный outcome определяется manifest):
 
 ```json
 {
-  "status": "ok | error",
-  "outcome": "created | found | ...",
-  "code": "error.code",
-  "message": "human-readable message",
-  "result": { ... },
-  "retryable": false,
-  "details": { },
+  "status": "ok",
+  "outcome": "CREATED",
+  "result": {},
   "meta": {
     "correlationId": "uuid",
     "actionVersion": 1
@@ -35,12 +31,16 @@ Action runtime возвращает два типа результатов:
 }
 ```
 
+Ошибка содержит `status=error`, `code`, `message` и при необходимости `retryable`, `details`, `meta`. `outcome` и `result` относятся к успешному subject result, а не к единому обязательному набору полей любого ответа.
+
 ### HTTP status codes
 
 | Сценарий                          | HTTP | `status` | Кто определяет |
 |-----------------------------------|------|----------|-----------------|
 | Успешная операция                 | 200  | `ok`     | Runtime + DB    |
 | Невалидный JWT                    | 401  | `error`  | Runtime (C#)    |
+| Неверная переданная HMAC-подпись | 401 | `error` | Runtime (C#) |
+| Отсутствующая подпись receipt | 403 | `error` | DB → Runtime |
 | Нет required scope                | 403  | `error`  | Runtime (C#)    |
 | Action не найден / disabled       | 404  | `error`  | Runtime (C#)    |
 | Невалидный payload (schema)       | 422  | `error`  | Runtime (C#)    |
@@ -55,7 +55,7 @@ Action runtime возвращает два типа результатов:
 - **5xx** — инфраструктурная ошибка (contract violation, timeout, DB unavailable).
 - **200** — бизнес-логика выполнена, outcome входит в зарегистрированный список, result прошёл response schema validation, транзакция закоммичена.
 
-Бизнес-ошибки, возвращённые PostgreSQL-функцией со `status = 'error'`, транслируются в HTTP 4xx/5xx с `code` из БД. Транзакция при этом откатывается.
+Envelope со `status=error` откатывает транзакцию и транслируется в HTTP 4xx/5xx. Для 5xx API скрывает target message и нормализует code; код/текст произвольной DB-ошибки не обещаны клиенту без изменений. Успешный `receipt.accept` возвращает HTTP `200`; HTTP `202` относится к внешнему provider `/payments`.
 
 ### Rollback contract
 

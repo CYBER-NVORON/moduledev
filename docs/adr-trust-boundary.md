@@ -17,13 +17,13 @@ Gateway выполняет только проксирование HTTP-запр
 - **не имеет** строки подключения к PostgreSQL;
 - **не имеет** доступа к JWT signing key;
 - **не выполняет** аутентификацию, авторизацию или бизнес-логику;
-- **не модифицирует** payload — только проксирует тело и контрактные заголовки (`Authorization`, `Idempotency-Key`, `X-Action-Version`).
+- **не модифицирует** payload — только проксирует тело и контрактные заголовки (`Authorization`, `Idempotency-Key`, `X-Action-Version`, `X-Provider-Signature`).
 
-Компрометация Gateway не даёт доступа к данным в PostgreSQL.
+Gateway не получает прямого SQL-доступа или credentials БД. При этом он видит проходящий HTTP-трафик: сетевая изоляция не делает компрометацию gateway безвредной для запросов клиентов.
 
 ### Граница 2: Api изолирован внутри Docker network
 
-Api не публикует host-порты. Доступ к Api возможен только через Gateway внутри `gateway-net`. С БД Api общается внутри `course-net`. Api:
+Api не публикует host-порты; публичный клиент обращается через Gateway. Контейнеры общей сети технически могут обращаться к API напрямую, поэтому JWT и policy проверяет сам API. С БД Api общается внутри `course-net`. Api:
 
 - проверяет JWT (issuer, audience, signature, expiry, claims);
 - формирует server-side context (`principal`, `consumer`, `scopes`, `correlationId`, `deadline`);
@@ -36,14 +36,16 @@ Api не публикует host-порты. Доступ к Api возможе�
 |---------------------|----------------------------------------------------------------|
 | `course_owner`      | `NOLOGIN`. Владелец объектов, `SECURITY DEFINER` функций.      |
 | `course_runtime`    | `LOGIN`. Выполняет `api.invoke`. Нет прямого DML к `payment.*`.|
-| `course_publication`| `LOGIN`. Ограниченная публикация манифестов в `catalog.*`. Без owner-прав и без доступа к `payment.*`. |
+| `course_publication`| `LOGIN`. Ограниченная публикация manifests и workflow-карт, служебные workflow-команды. Без owner membership и прямого DML к `payment.*`. |
 | `course_migration`  | `LOGIN`. Выполнение DDL-миграций структуры схемы (admin).      |
 | `workflow_worker`   | `LOGIN`. Выполняет `workflow.claim_jobs`, `api.invoke`, `workflow.finish_job`, `workflow.fail_job`. Нет прямого DML к `payment.*` и `workflow.*`. |
+| `outbox_dispatcher` | `LOGIN`. Только `delivery.claim_outbox`, `delivery.succeed_outbox`, `delivery.fail_outbox`. |
+| `inbox_reconciler` | `LOGIN`. Только `delivery.reconcile_inbox`. |
 
 `course_runtime` не может напрямую INSERT/UPDATE/DELETE в `payment.operations` или `payment.operation_events` — только через `SECURITY DEFINER` функции, принадлежащие `course_owner`. `payment.operations` защищена триггерами неизменяемости и графом допустимых переходов статусов, а `payment.operation_events` является строго append-only.
 
 ## Последствия
 
-- Атака на Gateway не даёт доступа к данным.
+- Gateway не получает прямого SQL-доступа к БД; публичные запросы проходят JWT/policy в API.
 - Атака на Api ограничена возможностями роли `course_runtime`.
-- Бизнес-инварианты (идемпотентность, уникальность операций) защищены на уровне PostgreSQL и не зависят от корректности C#-кода.
+- Идемпотентность и уникальность операций закреплены в PostgreSQL. Admission, response validation и корректное управление общей транзакцией остаются обязанностями C# runtime.

@@ -71,6 +71,7 @@ async Task ProxyRequest(HttpContext ctx, IHttpClientFactory httpFactory)
         ForwardHeader(ctx, request, "Authorization");
         ForwardHeader(ctx, request, "Idempotency-Key");
         ForwardHeader(ctx, request, "X-Action-Version");
+        ForwardHeader(ctx, request, "X-Provider-Signature");
 
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ctx.RequestAborted);
 

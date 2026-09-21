@@ -24,7 +24,11 @@ var jwtAudience = builder.Configuration["COURSE_JWT_AUDIENCE"];
 var jwtSigningKey = builder.Configuration["COURSE_JWT_SIGNING_KEY"];
 var dbConnection = builder.Configuration["COURSE_DB_CONNECTION"];
 
-var signingKeyBytes = Encoding.UTF8.GetBytes(jwtSigningKey);
+// An unconfigured local stack can serve health checks; it admits no actions.
+var jwtConfigured = !string.IsNullOrEmpty(jwtSigningKey) && !string.IsNullOrEmpty(jwtIssuer) && !string.IsNullOrEmpty(jwtAudience);
+var signingKeyBytes = string.IsNullOrEmpty(jwtSigningKey)
+    ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
+    : Encoding.UTF8.GetBytes(jwtSigningKey);
 var securityKey = new SymmetricSecurityKey(signingKeyBytes);
 
 var tokenValidationParams = new TokenValidationParameters
@@ -43,6 +47,7 @@ var tokenValidationParams = new TokenValidationParameters
 };
 
 var jwtHandler = new JwtSecurityTokenHandler();
+var providerHmacSecret = builder.Configuration["PROVIDER_HMAC_SECRET"] ?? "";
 
 var app = builder.Build();
 
@@ -96,6 +101,8 @@ app.MapGet("/openapi/actions/{module}/{action}/{version}.json", async (string mo
 // --- Generic Action Route ---
 app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, string action) =>
 {
+    if (!jwtConfigured)
+        return Results.Json(new { status = "error", code = "dependency.unavailable", message = "authentication is not configured" }, statusCode: 503);
     var stopwatch = System.Diagnostics.Stopwatch.StartNew();
     string? correlationId = Guid.NewGuid().ToString();
     int? actionVersion = null;
@@ -111,10 +118,41 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
         if (authErr is not null)
             return await ErrorResultAsync(401, "auth.invalid", authErr);
 
-        // 2. Read body to get hash, then parse (zero-allocation)
+        // 2. Buffer the exact request bytes for hashing, signature verification and parsing.
         ctx.Request.EnableBuffering();
         payloadHash = Convert.ToHexStringLower(await System.Security.Cryptography.SHA256.HashDataAsync(ctx.Request.Body, ctx.RequestAborted));
         ctx.Request.Body.Position = 0;
+
+        // 2.5. HMAC Signature Verification (X-Provider-Signature)
+        bool? signatureVerified = null; // null = header absent, false = invalid, true = valid
+        string? signatureHeader = ctx.Request.Headers["X-Provider-Signature"].FirstOrDefault();
+        if (signatureHeader is not null)
+        {
+            signatureVerified = false; // default: invalid unless proven otherwise
+            if (!string.IsNullOrEmpty(providerHmacSecret)
+                && signatureHeader.StartsWith("v1=", StringComparison.Ordinal)
+                && signatureHeader.Length == 67
+                && signatureHeader[3..].All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f')
+                && ctx.Request.Headers["X-Provider-Signature"].Count == 1)
+            {
+                var providedHex = signatureHeader[3..];
+                ctx.Request.Body.Position = 0;
+                using var hmac = new System.Security.Cryptography.HMACSHA256(
+                    Encoding.UTF8.GetBytes(providerHmacSecret));
+                var computedSignature = await hmac.ComputeHashAsync(ctx.Request.Body, ctx.RequestAborted);
+                ctx.Request.Body.Position = 0;
+
+                if (System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                    Convert.FromHexString(providedHex),
+                    computedSignature))
+                {
+                    signatureVerified = true;
+                }
+            }
+
+            if (signatureVerified != true)
+                return await ErrorResultAsync(401, "signature.invalid", "HMAC verification failed");
+        }
 
         // 3. Parse version header
         int? requestedVersion = null;
@@ -181,7 +219,24 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 }
 
                 // 8. Build server-side context
-                var context = JsonSerializer.SerializeToNode(new { principal, consumer, scopes, correlationId, requestId = idempotencyKey ?? "", deadline = DateTime.UtcNow.AddMilliseconds(manifest.TimeoutMs) });
+                var contextObj = new JsonObject
+                {
+                    ["principal"] = principal,
+                    ["consumer"] = consumer,
+                    ["scopes"] = JsonSerializer.SerializeToNode(scopes),
+                    ["correlationId"] = correlationId,
+                    ["requestId"] = idempotencyKey ?? "",
+                    ["payloadHash"] = payloadHash,
+                    ["deadline"] = DateTime.UtcNow.AddMilliseconds(manifest.TimeoutMs),
+                    ["transport"] = new JsonObject
+                    {
+                        ["signatureVerified"] = signatureVerified.HasValue
+                            ? (JsonNode)(bool)signatureVerified.Value
+                            : null,
+                        ["signatureVersion"] = signatureVerified == true ? (JsonNode)1 : null
+                    }
+                };
+                var context = contextObj;
 
                 // 8.5. Cross-version replay check (before schema validation)
                 if (requestedVersion is null && !string.IsNullOrEmpty(idempotencyKey))
@@ -203,6 +258,8 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                         {
                             return await ErrorResultAsync(409, "idempotency.conflict", replayNode?["message"]?.ToString() ?? "conflict");
                         }
+                        if (status == "error" && code == "receipt.signature_required")
+                            return await ErrorResultAsync(403, code, "signature required");
                         return Results.Json(replayNode, statusCode: 200);
                     }
                 }
@@ -268,6 +325,10 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     {
                         "idempotency.conflict" => 409,
                         "access.denied" => 403,
+                        "receipt.signature_required" => 403,
+                        "signature.invalid" => 401,
+                        "receipt.external_request_not_found" => 422,
+                        "workflow.decision_conflict" => 409,
                         "action.not_found" => 404,
                         "operation.not_found" => 404,
                         "payload.invalid" => 422,

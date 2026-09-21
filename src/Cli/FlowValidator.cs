@@ -125,7 +125,7 @@ public static class FlowValidator
                 {
                     foreach (var (constKey, _) in constants)
                     {
-                        var constPtr = constKey.StartsWith('/') ? constKey : "/" + constKey;
+                        var constPtr = "/" + constKey.Replace("~", "~0").Replace("/", "~1");
                         foreach (var targetPtr in targetPointers)
                         {
                             if (PointersOverlap(targetPtr, constPtr))
@@ -391,6 +391,11 @@ public static class FlowValidator
                 return (false, $"step '{key}' required_policy [{string.Join(", ", requiredPolicy)}] does not match action required_policy [{string.Join(", ", actionPolicy)}]");
             }
 
+            if (!actionPolicy.IsSubsetOf(Course.WorkflowPrincipal.Scopes))
+            {
+                return (false, $"step '{key}' requires scopes not granted to workflow-worker");
+            }
+
             // Outcomes check: transitions from this step must cover all action outcomes exactly once
             transByFrom.TryGetValue(key, out var stepTransOutcomes);
             stepTransOutcomes ??= new();
@@ -409,16 +414,29 @@ public static class FlowValidator
 
     public static bool PointersOverlap(string p1, string p2)
     {
-        var s1 = p1.AsSpan().Trim('/');
-        var s2 = p2.AsSpan().Trim('/');
-
-        if (s1.Length == 0 || s2.Length == 0) return true;
-        if (s1.SequenceEqual(s2)) return true;
+        var seg1 = ParsePointer(p1);
+        var seg2 = ParsePointer(p2);
         
-        if (s1.StartsWith(s2) && s1.Length > s2.Length && s1[s2.Length] == '/') return true;
-        if (s2.StartsWith(s1) && s2.Length > s1.Length && s2[s1.Length] == '/') return true;
+        if (seg1.Length == 0 || seg2.Length == 0) return true;
+        
+        int minLen = Math.Min(seg1.Length, seg2.Length);
+        for (int i = 0; i < minLen; i++)
+        {
+            if (seg1[i] != seg2[i]) return false;
+        }
+        return true;
+    }
 
-        return false;
+    private static string[] ParsePointer(string p)
+    {
+        if (string.IsNullOrEmpty(p)) return [];
+        if (p.StartsWith('/')) p = p[1..];
+        var parts = p.Split('/');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            parts[i] = parts[i].Replace("~1", "/").Replace("~0", "~");
+        }
+        return parts;
     }
 
     public static int? AsInt(JsonNode? node)

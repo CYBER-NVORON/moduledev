@@ -3,6 +3,7 @@ WORKDIR /src
 COPY src/Cli/Cli.csproj src/Cli/
 RUN dotnet restore src/Cli/Cli.csproj
 COPY src/Cli/ src/Cli/
+COPY src/Shared/ src/Shared/
 COPY contracts/ contracts/
 RUN dotnet publish src/Cli/Cli.csproj -c Release -o /app
 

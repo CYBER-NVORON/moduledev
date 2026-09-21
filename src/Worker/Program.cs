@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Json.Schema;
 using Npgsql;
+using System.Runtime.InteropServices;
 using Worker;
 
 var owner = Environment.GetEnvironmentVariable("COURSE_WORKER_OWNER")
@@ -28,6 +29,14 @@ Console.CancelKeyPress += (_, e) =>
     e.Cancel = true;
     cts.Cancel();
 };
+AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+{
+    cts.Cancel();
+};
+if (OperatingSystem.IsLinux())
+{
+    PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ => cts.Cancel());
+}
 
 while (!cts.Token.IsCancellationRequested)
 {
@@ -151,7 +160,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
     {
         var srcPtr = srcPtrNode?.GetValue<string>() ?? "";
         var (found, val) = JsonPointer.TryGet(job.ProcessData, srcPtr);
-        if (!found || val is null)
+        if (!found)
         {
             Console.Error.WriteLine($"[Worker {workerOwner}] Mapping missing for source pointer: {srcPtr}");
             await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "workflow.mapping_missing", false);
@@ -176,12 +185,23 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         }
     }
 
-    // Build trusted server-side context
+    // Build trusted server-side context from the service principal's permissions.
+    var workerScopes = Course.WorkflowPrincipal.Scopes;
+    foreach (var policy in job.RequiredPolicy)
+    {
+        if (!workerScopes.Contains(policy))
+        {
+            Console.Error.WriteLine($"[Worker {workerOwner}] Action requires policy '{policy}' which is not granted to worker.");
+            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "workflow.policy_denied", false);
+            return;
+        }
+    }
+
     var contextNode = new JsonObject
     {
         ["principal"] = "workflow-worker",
         ["consumer"] = "internal",
-        ["scopes"] = JsonSerializer.SerializeToNode(job.RequiredPolicy),
+        ["scopes"] = JsonSerializer.SerializeToNode(workerScopes),
         ["correlationId"] = Guid.NewGuid().ToString(),
         ["requestId"] = job.ExecutionId.ToString(),
         ["processId"] = job.ProcessId.ToString(),
@@ -251,10 +271,11 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
             return;
         }
 
-        var resultData = resObj["result"] as JsonObject ?? new JsonObject();
+        var resultData = resObj["result"];
         if (job.ResponseSchema is not null)
         {
-            var resEval = job.ResponseSchema.Evaluate(resultData, new EvaluationOptions
+            var evalNode = resultData ?? new JsonObject();
+            var resEval = job.ResponseSchema.Evaluate(evalNode, new EvaluationOptions
             {
                 OutputFormat = OutputFormat.List,
                 RequireFormatValidation = true
@@ -283,7 +304,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         finishCmd.Parameters.AddWithValue("owner", workerOwner);
         finishCmd.Parameters.AddWithValue("lv", job.LeaseVersion);
         finishCmd.Parameters.AddWithValue("outcome", outcome);
-        finishCmd.Parameters.AddWithValue("res", resultData.ToJsonString());
+        finishCmd.Parameters.AddWithValue("res", resultData?.ToJsonString() ?? "{}");
 
         await finishCmd.ExecuteNonQueryAsync(ct);
 

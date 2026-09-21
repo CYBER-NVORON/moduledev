@@ -51,7 +51,7 @@ public static class JsonPointer
         return (true, current);
     }
 
-    public static void Set(JsonObject root, string pointer, JsonNode value)
+    public static void Set(JsonObject root, string pointer, JsonNode? value)
     {
         var segments = ParseSegments(pointer);
         if (segments.Length == 0)
@@ -75,6 +75,6 @@ public static class JsonPointer
             }
         }
 
-        current[segments[^1]] = value.DeepClone();
+        current[segments[^1]] = value?.DeepClone();
     }
 }
