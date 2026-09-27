@@ -30,11 +30,18 @@
 - Каждому логическому заданию `job` при создании присваивается постоянный `execution_id` (UUID).
 - При повторных попытках (retries) или перехватах (reclaim) `job_id` и `execution_id` **сохраняются неизменными**, в то время как `attempt_id` создаётся новый, а `lease_version` инкрементируется.
 - `execution_id` передаётся в доверенный контекст `api.invoke` как `requestId` / `executionId`. Если manifest требует идемпотентность, runtime использует этот requestId в её scope. Дополнительные ограничения предметных таблиц задаются самими actions.
+- Контекст также содержит `processId`, `jobId`, `attemptId` и числовой `leaseVersion` из claim. Одноимённые поля payload не изменяют server-side context. При reclaim target видит новую attempt и поколение lease; сами проверки fencing остаются в `finish_job`/`fail_job`.
 
 ### 4. Атомарная транзакционная граница
 - Вызов `api.invoke` и вызов `workflow.finish_job` выполняются **в одной и той же Npgsql-транзакции**.
 - Если `api.invoke` завершился ошибкой или валидация схемы ответа не прошла — транзакция откатывается (предметный эффект не сохраняется). После этого в отдельной транзакции вызывается `workflow.fail_job`.
 - Если воркер упал в failpoint `after_action_before_finish` (до commit) — транзакция базы данных закрывается с ROLLBACK. Никаких частичных эффектов не остаётся.
+
+### 5. Диагностика попыток
+
+Worker пишет JSON events `worker.claim`, `worker.invoke`, `worker.finish`, `worker.fail`, `worker.retry`, `worker.stale` с едиными `processId`, `jobId`, `executionId`, `attemptId`, `leaseVersion` и `instanceId`. Записываются безопасные outcome/error code и состояние job, без payload и exception details.
+
+Finish логируется после commit. Fail/retry — после ответа `fail_job`, причём retry только при `RETRY_WAIT`. Если результат записи ошибки неизвестен, появляется `worker.fail_unconfirmed`, а не подтверждение retry. Прерывание до завершения отмечается `worker.interrupted`/`worker.abandoned`. Сбой между commit и записью лога возможен; авторитетным доказательством остаются PostgreSQL attempts/events. Контрактные failpoint acknowledgements сохранены отдельно.
 
 ## Последствия
 

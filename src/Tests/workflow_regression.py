@@ -119,7 +119,7 @@ class Regression:
         context = {"principal": "workflow-worker", "consumer": "internal",
                    "scopes": ["workflow:execute", "payment:internal"],
                    "requestId": job["executionId"], "correlationId": str(uuid.uuid4()),
-                   **{key: job[key] for key in ("processId", "jobId", "executionId", "attemptId")}}
+                   **{key: job[key] for key in ("processId", "jobId", "executionId", "attemptId", "leaseVersion")}}
         return self.sql(f"""BEGIN; SET LOCAL ROLE workflow_worker;
             SELECT api.invoke('regression', 'nullable', 1, {literal(context)}::jsonb, '{{"value":"ok"}}');
             SELECT workflow.finish_job({literal(job['jobId'])}, {literal(owner)}, {job['leaseVersion']}, 'DONE', '{{}}');
@@ -137,6 +137,23 @@ class Regression:
         wait_for(lambda: self.run(["docker", "inspect", name], ok=False).returncode, bool)
         self.workers.remove(name)
 
+    def invoke(self, module, action, payload, key=None, principal="regression-client", extra=None):
+        context = {"principal": principal, "consumer": "regression", "requestId": key or uuid.uuid4().hex,
+                   "correlationId": str(uuid.uuid4()),
+                   "scopes": ["payment:write", "payment:read", "payment:internal", "workflow:manual", "receipt:write"]}
+        context.update(extra or {})
+        return self.query(f"api.invoke({literal(module)}, {literal(action)}, 1, "
+                          f"{literal(context)}::jsonb, {literal(payload)}::jsonb)", "course_runtime")
+
+    def operation(self, kind="PAYMENT_APPROVAL", amount="100000.01"):
+        response = self.invoke("payment", "request", {"operationKind": kind, "amount": amount, "currency": "RUB"})
+        assert response["status"] == "ok", response
+        return response["result"]["operationId"]
+
+    def event_types(self, oid, relation="autocheck.operation_events"):
+        return self.query(f"COALESCE(jsonb_agg(event_type ORDER BY occurred_at,event_id),'[]') "
+                          f"FROM {relation} WHERE operation_id={literal(oid)}")
+
     def upgrade(self):
         self.run(self.compose + ["build", "postgres", "cli", "worker-a"], timeout=900)
         self.run(self.compose + ["up", "-d", "--wait", "postgres"], timeout=120)
@@ -146,19 +163,43 @@ class Regression:
         old = self.query("jsonb_object_agg(filename, checksum_sha256) FROM catalog.migrations")
         assert len(old) == 10, old
         assert old["004_workflow_schema.sql"] == "04374772050b5360a3cb8a1088ee2f92d158a7b32837da4ba81f4c479e2bed88"
+        # Synthetic historical rows exercise the read compatibility without rewriting audit history.
+        legacy = self.operation()
+        self.sql(f"""INSERT INTO payment.operation_events(operation_id,event_type,payload_hash)
+            SELECT {literal(legacy)}, name, repeat('0',64)
+            FROM unnest(ARRAY['OperationSubmitted','OperationCompleted','OperationRejected']) AS name;""")
+        history = self.query(f"jsonb_agg(to_jsonb(e) ORDER BY event_id) FROM payment.operation_events e "
+                             f"WHERE operation_id={literal(legacy)}")
         self.cli("migration", "apply", "/migrations")
         new = self.query("jsonb_object_agg(filename, checksum_sha256) FROM catalog.migrations")
         assert all(new[k] == v for k, v in old.items())
         assert "011_workflow_invariants.sql" in new
+        assert "012_operation_event_contract.sql" in new
+        assert "013_outbox_retry_policy.sql" in new
+        assert history == self.query(f"jsonb_agg(to_jsonb(e) ORDER BY event_id) FROM payment.operation_events e "
+                                     f"WHERE operation_id={literal(legacy)}")
+        expected = sorted(["OPERATION_CREATED", "OPERATION_SUBMITTED", "OPERATION_COMPLETED", "OPERATION_REJECTED"])
+        assert sorted(self.event_types(legacy)) == expected
+        public = self.invoke("operation", "events", {"operationId": legacy})
+        assert sorted(e["eventType"] for e in public["result"]["events"]) == expected
+        for invalid in ("OperationSubmitted", "OPERATION_UNKNOWN"):
+            result = self.sql(f"INSERT INTO payment.operation_events(operation_id,event_type,payload_hash) "
+                              f"VALUES ({literal(legacy)},{literal(invalid)},repeat('0',64));", ok=False)
+            assert result.returncode and "operation_events_canonical_type" in result.stderr
+        for statement in ("UPDATE payment.operation_events SET event_type='OPERATION_SUBMITTED'",
+                          "DELETE FROM payment.operation_events"):
+            result = self.sql(statement + f" WHERE operation_id={literal(legacy)};", ok=False)
+            assert result.returncode and "append-only" in result.stderr
         self.cli("migration", "apply", "/migrations")
         assert new == self.query("jsonb_object_agg(filename, checksum_sha256) FROM catalog.migrations")
-        print("PASS: upgrade 001..010 -> 011 and repeat migration", flush=True)
+        print("PASS: forward migrations, legacy event compatibility, append-only and canonical event guard", flush=True)
 
     def fixtures(self):
         self.sql((ROOT / "src/Tests/workflow_probe.sql").read_text(encoding="utf-8"))
         for action, value_type, policy in (("nullable", ["string", "null"], "workflow:execute"),
-                                            ("strict", "string", "payment:internal"),
-                                            ("forbidden", "string", "ungranted:scope")):
+                                         ("strict", "string", "payment:internal"),
+                                         ("context", "string", "workflow:execute"),
+                                         ("forbidden", "string", "ungranted:scope")):
             manifest = {"contract_version": "course-1", "module": "regression", "action": action,
                         "version": 1, "http_method": "POST", "target_schema": "regression",
                         "target_function": "execute", "request_schema": {"$schema": SCHEMA,
@@ -166,9 +207,17 @@ class Regression:
                         "additionalProperties": False}, "response_schema": {"$schema": SCHEMA, "type": "object"},
                         "outcomes": ["DONE"], "required_policy": [policy], "idempotency_mode": "none",
                         "idempotency_scope": "none", "timeout_ms": 2000, "enabled": True, "is_default": True}
+            if action == "context":
+                manifest["request_schema"]["properties"].update({key: {"type": "string"} for key in
+                    ("processId", "jobId", "executionId", "attemptId")})
+                manifest["request_schema"]["properties"]["leaseVersion"] = {"type": "integer"}
             self.cli("action", "publish", document=manifest)
         for action in ("nullable", "strict"):
             self.publish(flow_map(action))
+        context_flow = flow_map("context")
+        context_flow["steps"][0]["task"]["input_constants"] = {
+            **{key: "forged" for key in ("processId", "jobId", "executionId", "attemptId")}, "leaseVersion": -1}
+        self.publish(context_flow)
 
     def immutability(self):
         for assignment in ("map_json=map_json || '{\"extra\":true}'", "map_hash='changed'",
@@ -201,6 +250,7 @@ class Regression:
         reclaimed = self.claim("replacement")[0]
         assert all(original[k] == reclaimed[k] for k in ("jobId", "executionId", "processId"))
         assert original["attemptId"] != reclaimed["attemptId"]
+        assert reclaimed["leaseVersion"] > original["leaseVersion"]
         before = self.snapshot(pid)
         assert [a["status"] for a in before["attempts"]] == ["STALE", "RUNNING"]
         stale = self.finish(original, owner)
@@ -233,6 +283,100 @@ class Regression:
         assert len({a["attempt_id"] for a in state["attempts"]}) == 4
         assert sum(e["event_type"] == "TaskFailed" for e in state["events"]) == 1
         print("PASS: STALE does not consume retry budget; failure-indexed delays and exhaustion", flush=True)
+
+    def outbox_retry_policy(self):
+        # No dispatcher/worker runs here. Fixtures and simulated elapsed delays are
+        # rolled back; one transaction makes now() stable for exact delay assertions.
+        self.sql("""BEGIN;
+            SET LOCAL plpgsql.check_asserts = on;
+            DO $$
+            DECLARE
+                scenario text;
+                oid uuid;
+                pid uuid;
+                external_id text;
+                claimed record;
+                current_row delivery.outbox%ROWTYPE;
+                before_row jsonb;
+                result jsonb;
+                attempt integer;
+            BEGIN
+                FOREACH scenario IN ARRAY ARRAY['exhausted','success','terminal','confirmed'] LOOP
+                    oid := gen_random_uuid();
+                    pid := gen_random_uuid();
+                    external_id := gen_random_uuid()::text;
+                    INSERT INTO workflow.process_instances(process_id,business_key,flow_name,flow_version)
+                        VALUES(pid,external_id,'regression-nullable',1);
+                    INSERT INTO payment.operations(operation_id,principal,request_id,operation_kind,amount)
+                        VALUES(oid,'regression',external_id,'PAYMENT_EXECUTION',1);
+                    INSERT INTO delivery.external_requests(external_request_id,operation_id,process_id,correlation_id,payload_hash)
+                        VALUES(external_id,oid,pid,gen_random_uuid(),repeat('0',64));
+                    INSERT INTO delivery.outbox(external_request_id) VALUES(external_id);
+
+                    FOR attempt IN 1..4 LOOP
+                        SET LOCAL ROLE outbox_dispatcher;
+                        SELECT * INTO STRICT claimed FROM delivery.claim_outbox('retry-probe',1);
+                        RESET ROLE;
+                        ASSERT claimed.external_request_id = external_id, 'claim selected wrong request';
+                        SELECT * INTO STRICT current_row FROM delivery.outbox WHERE outbox_id=claimed.outbox_id;
+                        ASSERT current_row.attempt_count = attempt AND current_row.state = 'LEASED', 'attempt count';
+                        before_row := to_jsonb(current_row);
+
+                        SET LOCAL ROLE outbox_dispatcher;
+                        result := delivery.fail_outbox(claimed.outbox_id,'wrong-owner',claimed.lease_version,'test.retryable');
+                        ASSERT result = '{"updated":false}'::jsonb, 'wrong owner accepted';
+                        result := delivery.fail_outbox(claimed.outbox_id,'retry-probe',claimed.lease_version-1,'test.retryable');
+                        ASSERT result = '{"updated":false}'::jsonb, 'stale lease accepted';
+                        RESET ROLE;
+                        ASSERT (SELECT to_jsonb(o) FROM delivery.outbox o WHERE outbox_id=claimed.outbox_id) = before_row,
+                            'rejected failure changed outbox';
+
+                        IF scenario = 'confirmed' THEN
+                            -- Simulate the state committed by an early receipt.
+                            UPDATE delivery.outbox SET state='CONFIRMED' WHERE outbox_id=claimed.outbox_id;
+                        END IF;
+                        SET LOCAL ROLE outbox_dispatcher;
+                        IF scenario = 'success' AND attempt = 4 THEN
+                            result := delivery.succeed_outbox(claimed.outbox_id,'retry-probe',claimed.lease_version,'provider-id');
+                        ELSE
+                            result := delivery.fail_outbox(claimed.outbox_id,'retry-probe',claimed.lease_version,
+                                CASE WHEN scenario = 'terminal' THEN 'response.invalid.terminal' ELSE 'test.retryable' END);
+                        END IF;
+                        RESET ROLE;
+                        ASSERT result = jsonb_build_object('updated',scenario <> 'confirmed'), 'unexpected update result';
+                        SELECT * INTO STRICT current_row FROM delivery.outbox WHERE outbox_id=claimed.outbox_id;
+                        ASSERT current_row.attempt_count = attempt, 'failure changed attempt count';
+
+                        IF scenario IN ('terminal','confirmed') OR attempt = 4 THEN
+                            ASSERT current_row.state = CASE scenario WHEN 'success' THEN 'DELIVERED'
+                                WHEN 'confirmed' THEN 'CONFIRMED' ELSE 'DEAD' END, 'final state';
+                            before_row := to_jsonb(current_row);
+                            SET LOCAL ROLE outbox_dispatcher;
+                            result := delivery.fail_outbox(claimed.outbox_id,'retry-probe',claimed.lease_version,'test.retryable');
+                            ASSERT result = '{"updated":false}'::jsonb, 'final state accepted failure';
+                            RESET ROLE;
+                            ASSERT (SELECT to_jsonb(o) FROM delivery.outbox o WHERE outbox_id=claimed.outbox_id) = before_row,
+                                'final row changed';
+                            UPDATE delivery.outbox SET next_attempt_at=now()-interval '1 second' WHERE outbox_id=claimed.outbox_id;
+                            SET LOCAL ROLE outbox_dispatcher;
+                            ASSERT NOT EXISTS (SELECT 1 FROM delivery.claim_outbox('retry-probe',1)), 'final state reclaimed';
+                            RESET ROLE;
+                            EXIT;
+                        END IF;
+
+                        ASSERT current_row.state = 'RETRY_WAIT', 'retry stopped before fourth attempt';
+                        ASSERT extract(epoch FROM current_row.next_attempt_at-now())*1000 = (ARRAY[200,400,800])[attempt],
+                            'incorrect retry delay';
+                        SET LOCAL ROLE outbox_dispatcher;
+                        ASSERT NOT EXISTS (SELECT 1 FROM delivery.claim_outbox('retry-probe',1)), 'retry claimed too early';
+                        RESET ROLE;
+                        UPDATE delivery.outbox SET next_attempt_at=now()-interval '1 second' WHERE outbox_id=claimed.outbox_id;
+                    END LOOP;
+                END LOOP;
+            END;
+            $$;
+            ROLLBACK;""")
+        print("PASS: Outbox four attempts, exact 200/400/800 ms delays, exhaustion, success, terminal errors and fencing", flush=True)
 
     def signals(self):
         flow = {"contract_version": "course-1", "flow_name": "regression-signal", "version": 1,
@@ -294,6 +438,9 @@ class Regression:
                  lambda log: '"event":"failpoint.reached"' in log)
         before = self.snapshot(pid)
         assert before["effects"] == 0 and before["jobs"][0]["state"] == "LEASED"
+        pending_logs = self.run(["docker", "logs", worker]).stdout
+        assert '"event":"worker.invoke"' in pending_logs
+        assert '"event":"worker.finish"' not in pending_logs, "No success log before commit"
         self.stop_worker(worker)  # SIGKILL while the action/finish transaction is open.
         worker = self.worker()
         try:
@@ -305,7 +452,118 @@ class Regression:
         assert [a["status"] for a in after["attempts"]] == ["STALE", "SUCCEEDED"]
         assert len({a["attempt_id"] for a in after["attempts"]}) == 2
         assert sum(e["event_type"] == "TaskCompleted" for e in after["events"]) == 1
+        context = self.query(f"context FROM regression.effects WHERE process_id={literal(pid)}")
+        assert context["leaseVersion"] == after["jobs"][0]["lease_version"]
+        assert context["attemptId"] == after["attempts"][-1]["attempt_id"]
         print("PASS: crash after action rolls back effect; reclaim completes exactly once", flush=True)
+
+    def telemetry_and_context(self):
+        cases = [("context", "sensitive-payload-value", "COMPLETED", 1),
+                 ("strict", "retry-once", "COMPLETED", 2),
+                 ("strict", "raise-error", "FAILED", 3),
+                 ("strict", "null-result", "FAILED", 1)]
+        processes = [(self.start("regression-" + action, "logs-" + value, {"source": value}), final, attempts)
+                     for action, value, final, attempts in cases]
+        worker = self.worker()
+        try:
+            for pid, final, attempt_count in processes:
+                state = wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == final)
+                assert len(state["attempts"]) == attempt_count
+                assert state["effects"] == (1 if final == "COMPLETED" else 0)
+                if final == "COMPLETED":
+                    context = self.query(f"context FROM regression.effects WHERE process_id={literal(pid)}")
+                    assert context["processId"] == pid
+                    assert context["jobId"] == state["jobs"][0]["job_id"]
+                    assert context["executionId"] == state["jobs"][0]["execution_id"]
+                    assert context["attemptId"] == state["attempts"][-1]["attempt_id"]
+                    assert type(context["leaseVersion"]) is int
+                    assert context["leaseVersion"] == state["attempts"][-1]["lease_version"]
+                logs = wait_for(lambda: self.run(["docker", "logs", worker]).stdout,
+                                lambda log: any(e.get("processId") == pid and
+                                                e.get("event") in ("worker.finish", "worker.fail") and
+                                                e.get("attemptId") == state["attempts"][-1]["attempt_id"]
+                                                for e in map(json.loads, log.splitlines())))
+                assert "sensitive-payload-value" not in logs and "sensitive-regression-message" not in logs
+                events = [e for e in map(json.loads, logs.splitlines()) if e.get("processId") == pid]
+                for attempt in state["attempts"]:
+                    chain = [e for e in events if e["attemptId"] == attempt["attempt_id"]]
+                    for event in chain:
+                        assert event["jobId"] == state["jobs"][0]["job_id"]
+                        assert event["executionId"] == attempt["execution_id"]
+                        assert event["leaseVersion"] == attempt["lease_version"]
+                        assert event["instanceId"] == "worker-a" and event["timestamp"]
+                    names = [e["event"] for e in chain]
+                    if attempt["status"] == "SUCCEEDED":
+                        assert names == ["worker.claim", "worker.invoke", "worker.finish"], names
+                    elif attempt != state["attempts"][-1]:
+                        assert names == ["worker.claim", "worker.invoke", "worker.fail", "worker.retry"], names
+                    else:
+                        assert names == ["worker.claim", "worker.invoke", "worker.fail"], names
+            null_state = self.snapshot(processes[-1][0])
+            assert null_state["attempts"][0]["error_code"] == "action.contract_violation"
+        finally:
+            self.stop_worker(worker)
+        print("PASS: real worker context, payload spoof rejection, correlated retry/failure logs and safe errors", flush=True)
+
+    def payment_events(self):
+        # A rolled-back submit must leave neither process nor event nor operation transition.
+        oid = self.operation()
+        context = {"principal": "regression-client", "consumer": "regression", "scopes": ["payment:write"],
+                   "correlationId": str(uuid.uuid4()), "requestId": "rollback-submit"}
+        self.sql(f"""BEGIN; SET LOCAL ROLE course_runtime;
+            SELECT api.invoke('payment','submit',1,{literal(context)}::jsonb,
+                              {literal({'operationId': oid})}::jsonb); ROLLBACK;""")
+        assert self.query(f"to_jsonb(status='CREATED' AND process_id IS NULL) FROM payment.operations WHERE operation_id={literal(oid)}")
+        assert self.event_types(oid) == ["OPERATION_CREATED"]
+        assert self.query(f"count(*) FROM workflow.process_instances WHERE business_key={literal(oid)}") == 0
+
+        worker = self.worker()
+        try:
+            for kind, decision, distinct in (("PAYMENT_APPROVAL", "APPROVED", False),
+                                             ("PAYMENT_APPROVAL", "REJECTED", True),
+                                             ("PAYMENT_APPROVAL", None, False),
+                                             ("PAYMENT_EXECUTION", "COMPLETED", False),
+                                             ("PAYMENT_EXECUTION", "REJECTED", False)):
+                oid = self.operation(kind, "1000.00" if decision is None else "100000.01")
+                shared_key = uuid.uuid4().hex
+                keys = [uuid.uuid4().hex if distinct else shared_key for _ in range(20)]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+                    responses = list(pool.map(lambda key: self.invoke("payment", "submit", {"operationId": oid}, key), keys))
+                assert all(r["status"] == "ok" for r in responses), responses
+                pid = responses[0]["result"]["processId"]
+                assert all(r["result"] == responses[0]["result"] for r in responses)
+                assert self.query(f"count(*) FROM workflow.process_instances WHERE business_key={literal(oid)}") == 1
+                if kind == "PAYMENT_EXECUTION":
+                    wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == "WAITING_SIGNAL")
+                    external = self.query(f"to_jsonb(external_request_id) FROM delivery.external_requests WHERE operation_id={literal(oid)}")
+                    message_id = uuid.uuid4().hex
+                    receipt = {"version": 1, "messageId": message_id, "externalRequestId": external,
+                               "providerPaymentId": message_id, "outcome": decision, "occurredAt": "2026-01-01T00:00:00Z"}
+                    # Trusted SQL fixture: HMAC/adapter transport is exercised by the official checker.
+                    body_hash = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
+                    response = self.invoke("receipt", "accept", receipt, extra={"payloadHash": body_hash,
+                                            "transport": {"signatureVerified": True, "signatureVersion": 1}})
+                    assert response["status"] == "ok", response
+                    assert self.query("delivery.reconcile_inbox(10)", "inbox_reconciler") == 1
+                elif decision is not None:
+                    wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == "WAITING_MANUAL")
+                    sid = self.query(f"to_jsonb(step_instance_id) FROM workflow.step_instances WHERE process_id={literal(pid)} AND step_type='MANUAL'")
+                    response = self.invoke("workflow", "manual", {"processId": pid, "stepInstanceId": sid,
+                                           "decision": decision, "reason": "regression"}, principal="reviewer")
+                    assert response["status"] == "ok", response
+                wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == "COMPLETED")
+                final = "REJECTED" if decision == "REJECTED" else "COMPLETED"
+                assert self.query(f"to_jsonb(status) FROM payment.operations WHERE operation_id={literal(oid)}") == final
+                expected = ["OPERATION_CREATED", "OPERATION_SUBMITTED", "OPERATION_" + final]
+                assert self.event_types(oid) == expected
+                assert self.event_types(oid, "payment.operation_events") == expected
+                read = self.invoke("operation", "events", {"operationId": oid})
+                assert [e["eventType"] for e in read["result"]["events"]] == expected
+                repeat = self.invoke("payment", "submit", {"operationId": oid})
+                assert repeat["result"] == responses[0]["result"] and self.event_types(oid) == expected
+        finally:
+            self.stop_worker(worker)
+        print("PASS: concurrent submit, atomic rollback and canonical events for receipt/auto/manual finals", flush=True)
 
     def close(self):
         for name in self.workers:
@@ -314,7 +572,7 @@ class Regression:
 
 
 def flow_map(action):
-    policy = {"nullable": "workflow:execute", "strict": "payment:internal", "forbidden": "ungranted:scope"}[action]
+    policy = {"nullable": "workflow:execute", "context": "workflow:execute", "strict": "payment:internal", "forbidden": "ungranted:scope"}[action]
     return {"contract_version": "course-1", "flow_name": "regression-" + action, "version": 1,
             "start_step": "work", "steps": [{"key": "work", "type": "automatic", "task": {
                 "service": "postgres", "module": "regression", "action": action, "action_version": 1,
@@ -329,8 +587,9 @@ if __name__ == "__main__":
         suite = Regression(Path(temporary))
         try:
             for test in (suite.upgrade, suite.fixtures, suite.immutability,
-                         suite.competing_claims_and_fencing, suite.retry_budget,
-                         suite.signals, suite.mapping_and_policy, suite.crash_recovery):
+                         suite.competing_claims_and_fencing, suite.retry_budget, suite.outbox_retry_policy,
+                         suite.signals, suite.mapping_and_policy, suite.crash_recovery,
+                         suite.telemetry_and_context, suite.payment_events):
                 test()
             print("All workflow DB regressions passed.", flush=True)
         finally:

@@ -21,7 +21,7 @@ var failpoint = Environment.GetEnvironmentVariable("COURSE_FAILPOINT");
 var leaseSec = testProfile ? 2 : 30;
 var pollMs = testProfile ? 100 : 1000;
 
-Console.Error.WriteLine($"[Worker {owner}] Starting with leaseSec={leaseSec}, pollMs={pollMs}, failpoint={failpoint}");
+EmitEvent("worker.started", owner);
 
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
@@ -46,7 +46,21 @@ while (!cts.Token.IsCancellationRequested)
 
         foreach (var job in claimedJobs)
         {
-            await ProcessJobAsync(dbConn, owner, job, failpoint, cts.Token);
+            EmitEvent("worker.claim", owner, job);
+            try
+            {
+                await ProcessJobAsync(dbConn, owner, job, failpoint, cts.Token);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                EmitEvent("worker.interrupted", owner, job);
+                throw;
+            }
+            catch (Exception)
+            {
+                EmitEvent("worker.abandoned", owner, job, errorCode: "internal.error");
+                throw;
+            }
         }
 
         if (claimedJobs.Count == 0)
@@ -58,9 +72,9 @@ while (!cts.Token.IsCancellationRequested)
     {
         break;
     }
-    catch (Exception ex)
+    catch (Exception)
     {
-        Console.Error.WriteLine($"[Worker {owner}] Polling loop error: {ex.Message}");
+        EmitEvent("worker.poll_error", owner, errorCode: "internal.error");
         try
         {
             await Task.Delay(pollMs, cts.Token);
@@ -72,7 +86,7 @@ while (!cts.Token.IsCancellationRequested)
     }
 }
 
-Console.Error.WriteLine($"[Worker {owner}] Stopped");
+EmitEvent("worker.stopped", owner);
 
 async Task<List<ClaimedJob>> ClaimJobsAsync(string connStr, string workerOwner, int limit, int leaseSeconds, CancellationToken ct)
 {
@@ -135,17 +149,15 @@ async Task<List<ClaimedJob>> ClaimJobsAsync(string connStr, string workerOwner, 
             ));
         }
     }
-    catch (Exception ex) when (!ct.IsCancellationRequested)
+    catch (Exception) when (!ct.IsCancellationRequested)
     {
-        Console.Error.WriteLine($"[Worker {workerOwner}] Error claiming jobs: {ex.Message}");
+        EmitEvent("worker.claim_error", workerOwner, errorCode: "internal.error");
     }
     return list;
 }
 
 async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, string? activeFailpoint, CancellationToken ct)
 {
-    Console.Error.WriteLine($"[Worker {workerOwner}] Processing job {job.JobId} ({job.Module}.{job.Action} v{job.ActionVersion}, lease v{job.LeaseVersion})");
-
     // Failpoint: after_job_claim
     if (activeFailpoint == "after_job_claim")
     {
@@ -162,8 +174,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         var (found, val) = JsonPointer.TryGet(job.ProcessData, srcPtr);
         if (!found)
         {
-            Console.Error.WriteLine($"[Worker {workerOwner}] Mapping missing for source pointer: {srcPtr}");
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "workflow.mapping_missing", false);
+            await FailJobAsync(connStr, job, workerOwner, "workflow.mapping_missing", false);
             return;
         }
         JsonPointer.Set(payload, targetPtr, val);
@@ -179,8 +190,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         });
         if (!reqEval.IsValid)
         {
-            Console.Error.WriteLine($"[Worker {workerOwner}] Request payload validation failed");
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "payload.invalid", false);
+            await FailJobAsync(connStr, job, workerOwner, "payload.invalid", false);
             return;
         }
     }
@@ -191,8 +201,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
     {
         if (!workerScopes.Contains(policy))
         {
-            Console.Error.WriteLine($"[Worker {workerOwner}] Action requires policy '{policy}' which is not granted to worker.");
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "workflow.policy_denied", false);
+            await FailJobAsync(connStr, job, workerOwner, "workflow.policy_denied", false);
             return;
         }
     }
@@ -208,6 +217,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         ["jobId"] = job.JobId.ToString(),
         ["executionId"] = job.ExecutionId.ToString(),
         ["attemptId"] = job.AttemptId.ToString(),
+        ["leaseVersion"] = job.LeaseVersion,
         ["deadline"] = DateTime.UtcNow.AddMilliseconds(job.TimeoutMs).ToString("o")
     };
 
@@ -235,11 +245,12 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         invokeCmd.Parameters.AddWithValue("ctx", contextNode.ToJsonString());
         invokeCmd.Parameters.AddWithValue("pld", payload.ToJsonString());
 
+        EmitEvent("worker.invoke", workerOwner, job);
         var invokeResultStr = await invokeCmd.ExecuteScalarAsync(ct) as string;
         if (invokeResultStr is null)
         {
             await tx.RollbackAsync(ct);
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "action.contract_violation", false);
+            await FailJobAsync(connStr, job, workerOwner, "action.contract_violation", false);
             return;
         }
 
@@ -247,7 +258,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         if (resObj is null)
         {
             await tx.RollbackAsync(ct);
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "action.contract_violation", false);
+            await FailJobAsync(connStr, job, workerOwner, "action.contract_violation", false);
             return;
         }
 
@@ -256,35 +267,31 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         {
             var errCode = resObj["code"]?.GetValue<string>() ?? "internal.error";
             var retryable = resObj["retryable"]?.GetValue<bool>() ?? false;
-            Console.Error.WriteLine($"[Worker {workerOwner}] Action returned error: {errCode} (retryable={retryable})");
             await tx.RollbackAsync(ct);
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, errCode, retryable);
+            await FailJobAsync(connStr, job, workerOwner, errCode, retryable);
             return;
         }
 
         var outcome = resObj["outcome"]?.GetValue<string>();
         if (outcome is null || !job.ExpectedOutcomes.Contains(outcome))
         {
-            Console.Error.WriteLine($"[Worker {workerOwner}] Action returned unexpected outcome: {outcome}");
             await tx.RollbackAsync(ct);
-            await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "workflow.unknown_outcome", false);
+            await FailJobAsync(connStr, job, workerOwner, "workflow.unknown_outcome", false);
             return;
         }
 
         var resultData = resObj["result"];
         if (job.ResponseSchema is not null)
         {
-            var evalNode = resultData ?? new JsonObject();
-            var resEval = job.ResponseSchema.Evaluate(evalNode, new EvaluationOptions
+            var resEval = job.ResponseSchema.Evaluate(resultData, new EvaluationOptions
             {
                 OutputFormat = OutputFormat.List,
                 RequireFormatValidation = true
             });
             if (!resEval.IsValid)
             {
-                Console.Error.WriteLine($"[Worker {workerOwner}] Response schema validation failed");
                 await tx.RollbackAsync(ct);
-                await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "action.contract_violation", false);
+                await FailJobAsync(connStr, job, workerOwner, "action.contract_violation", false);
                 return;
             }
         }
@@ -304,34 +311,37 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         finishCmd.Parameters.AddWithValue("owner", workerOwner);
         finishCmd.Parameters.AddWithValue("lv", job.LeaseVersion);
         finishCmd.Parameters.AddWithValue("outcome", outcome);
-        finishCmd.Parameters.AddWithValue("res", resultData?.ToJsonString() ?? "{}");
+        finishCmd.Parameters.AddWithValue("res", resultData?.ToJsonString() ?? "null");
 
         await finishCmd.ExecuteNonQueryAsync(ct);
 
         // Commit both action effect and job completion atomically
         await tx.CommitAsync(ct);
-        Console.Error.WriteLine($"[Worker {workerOwner}] Job {job.JobId} finished successfully with outcome {outcome}");
+        EmitEvent("worker.finish", workerOwner, job, outcome: outcome, jobState: "SUCCEEDED");
     }
     catch (PostgresException ex) when (ex.MessageText == "workflow.lease_stale")
     {
         try { await tx.RollbackAsync(ct); } catch { }
-        Console.Error.WriteLine($"[Worker {workerOwner}] Job {job.JobId} lease is stale (reclaimed by another worker)");
+        EmitEvent("worker.stale", workerOwner, job, errorCode: "workflow.lease_stale");
     }
     catch (Exception ex) when (ex is PostgresException { SqlState: "57014" } || ex.InnerException is TimeoutException || ex is TimeoutException)
     {
         try { await tx.RollbackAsync(ct); } catch { }
-        Console.Error.WriteLine($"[Worker {workerOwner}] Action timed out for job {job.JobId}");
-        await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "action.timeout", true);
+        await FailJobAsync(connStr, job, workerOwner, "action.timeout", true);
     }
-    catch (Exception ex)
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        try { await tx.RollbackAsync(CancellationToken.None); } catch { }
+        throw;
+    }
+    catch (Exception)
     {
         try { await tx.RollbackAsync(ct); } catch { }
-        Console.Error.WriteLine($"[Worker {workerOwner}] Unexpected error executing job {job.JobId}: {ex.Message}");
-        await FailJobAsync(connStr, job.JobId, workerOwner, job.LeaseVersion, "internal.error", true);
+        await FailJobAsync(connStr, job, workerOwner, "internal.error", true);
     }
 }
 
-async Task FailJobAsync(string connStr, Guid jobId, string workerOwner, long leaseVersion, string errorCode, bool retryable)
+async Task FailJobAsync(string connStr, ClaimedJob job, string workerOwner, string errorCode, bool retryable)
 {
     try
     {
@@ -340,22 +350,51 @@ async Task FailJobAsync(string connStr, Guid jobId, string workerOwner, long lea
 
         await using var cmd = new NpgsqlCommand(
             "SELECT workflow.fail_job(@jid, @owner, @lv, @code, @ret)", conn);
-        cmd.Parameters.AddWithValue("jid", jobId);
+        cmd.Parameters.AddWithValue("jid", job.JobId);
         cmd.Parameters.AddWithValue("owner", workerOwner);
-        cmd.Parameters.AddWithValue("lv", leaseVersion);
+        cmd.Parameters.AddWithValue("lv", job.LeaseVersion);
         cmd.Parameters.AddWithValue("code", errorCode);
         cmd.Parameters.AddWithValue("ret", retryable);
 
-        await cmd.ExecuteNonQueryAsync();
+        var result = await cmd.ExecuteScalarAsync() as string;
+        var state = JsonNode.Parse(result!)?["jobState"]?.GetValue<string>();
+        if (state is not ("RETRY_WAIT" or "DEAD"))
+            throw new InvalidOperationException("Invalid fail_job result");
+        EmitEvent("worker.fail", workerOwner, job, errorCode: errorCode, jobState: state);
+        if (state == "RETRY_WAIT")
+            EmitEvent("worker.retry", workerOwner, job, errorCode: errorCode, jobState: state);
     }
     catch (PostgresException ex) when (ex.MessageText == "workflow.lease_stale")
     {
-        // Stale lease, ignored
+        EmitEvent("worker.stale", workerOwner, job, errorCode: "workflow.lease_stale");
     }
-    catch (Exception ex)
+    catch (Exception)
     {
-        Console.Error.WriteLine($"[Worker {workerOwner}] Error recording fail_job: {ex.Message}");
+        EmitEvent("worker.fail_unconfirmed", workerOwner, job, errorCode: "internal.error");
     }
+}
+
+void EmitEvent(string eventName, string instanceId, ClaimedJob? job = null,
+    string? outcome = null, string? errorCode = null, string? jobState = null)
+{
+    // Only bounded contract codes are loggable; never serialize target messages or exceptions.
+    if (errorCode is not null && (errorCode.Length > 128 ||
+        !System.Text.RegularExpressions.Regex.IsMatch(errorCode, @"\A[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\z")))
+        errorCode = "internal.error";
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        @event = eventName,
+        timestamp = DateTime.UtcNow,
+        instanceId,
+        processId = job?.ProcessId,
+        jobId = job?.JobId,
+        executionId = job?.ExecutionId,
+        attemptId = job?.AttemptId,
+        leaseVersion = job?.LeaseVersion,
+        outcome,
+        errorCode,
+        jobState
+    }));
 }
 
 void EmitFailpoint(string name, string instanceId)

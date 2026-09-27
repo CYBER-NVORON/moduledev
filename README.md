@@ -59,7 +59,7 @@ curl http://localhost:8080/health/ready
 
 **Как работает инициализация базы (Database-First Init):**
 Вместо хардкода паролей в SQL, был собран кастомный образ БД (`src/Postgres/Dockerfile`). 
-При самом первом запуске встроенный механизм Postgres исполняет скрипт `000_set_passwords.sh`, который безопасно подтягивает пароли из `.env` и создает роли. Следом накатываются SQL-миграции `001..011`, создавая таблицы, привязывая их к ролям, и устанавливая строгие Append-Only триггеры на таблицы аудита.
+При самом первом запуске встроенный механизм Postgres исполняет скрипт `000_set_passwords.sh`, который безопасно подтягивает пароли из `.env` и создает роли. Следом накатываются SQL-миграции `001..013`, создавая таблицы, привязывая их к ролям, и устанавливая строгие Append-Only триггеры на таблицы аудита.
 
 ### Конфигурация
 
@@ -95,12 +95,21 @@ SQL-миграции находятся в `migrations/`. При первом з
 
 ```text
 docker compose build cli
+docker compose stop api worker-a worker-b outbox-dispatcher receipt-adapter inbox-reconciler
 docker compose up -d postgres
 docker compose run --rm cli migration apply /migrations
 docker compose up -d --build
 ```
 
 Продолжайте обновление только после успешного завершения migration command. Compose не ждёт завершения CLI перед запуском API/workers, а readiness не проверяет максимальный номер миграции.
+
+Миграция `012_operation_event_contract.sql` обновляет функции `payment.submit/complete/reject/approve` и проверяет новые записи событий: `OPERATION_CREATED`, `OPERATION_SUBMITTED`, `OPERATION_COMPLETED`, `OPERATION_REJECTED`. Для существующей БД применяется тот же порядок обновления с остановкой обработчиков. Миграции `001..011` и их checksums сохранены.
+
+Старая append-only история не переписывается. `autocheck.operation_events` и `operation.events` переводят только исторические имена `OperationSubmitted`, `OperationCompleted`, `OperationRejected` в канонические uppercase-значения, сохраняя IDs, хеши и время. CHECK добавлен как `NOT VALID`: он проверяет новые записи, а существующие строки остаются нетронутыми. `workflow.events` сохраняет PascalCase (`TaskFailed`, `StepCompleted` и другие).
+
+Миграция `013_outbox_retry_policy.sql` обновляет `delivery.fail_outbox`: всего 4 попытки, включая первую, с задержками повторов 200/400/800 мс. Сохраняются права функции и проверки владельца, версии lease и состояния `LEASED`; поздняя ошибка dispatcher не меняет `CONFIRMED`. Применяется тот же порядок обновления БД, без изменения миграций `001..012`. Существующие строки Outbox, включая `DEAD`, автоматически не перезапускаются.
+
+БД с прежним локальным именем миграции `008_week3_delivery.sql` требует отдельного согласования истории: текущий файл называется `008_delivery_system.sql`, и CLI идентифицирует миграцию по имени и checksum. Не подменяйте checksum и записи журнала для обхода проверки.
 
 CLI читает пути внутри контейнера. Для публикации пользовательского manifest смонтируйте каталог с ним (пример предполагает `manifest.json` в корне репозитория):
 
@@ -158,6 +167,8 @@ docker compose run --rm -v "./:/input:ro" cli flow signal <process-id> --type <s
 
 Claim фиксируется короткой транзакцией. Затем `api.invoke`, валидация response и `finish_job` выполняются в одной другой транзакции. При ошибке предметный эффект откатывается; `fail_job` вызывается отдельно. Missing source mapping даёт `workflow.mapping_missing`; существующий JSON `null` передаётся request schema.
 
+Trusted context содержит `processId`, `jobId`, `executionId`, `attemptId` и числовой `leaseVersion` из claim. Поля payload не назначают эти значения. Result action проверяется в исходном JSON-типе, включая `null`, без подмены пустым объектом.
+
 ### Python-периметр (Week 3)
 
 Сначала `payment.request` создаёт operation из `operationKind`, строкового `amount` и `currency=RUB`. Затем `payment.submit` принимает только `operationId` и использует server-side binding: `PAYMENT_EXECUTION` → `payment-processing`, `PAYMENT_APPROVAL` → `payment-review`. Только в `payment-review` правило `course-limit-v1` одобряет сумму до `100000.00 RUB` включительно; при превышении процесс переходит в `WAITING_MANUAL` и ждёт action `workflow.manual` с решением, reason и principal из JWT.
@@ -168,36 +179,71 @@ Claim фиксируется короткой транзакцией. Затем
 * **Adapter:** принимает legacy callback provider v0.2.0 без HMAC по capability URL. Валидирует body до 64 KiB, преобразует его в receipt v1 и подписывает compact sorted JSON bytes. Передаёт JWT и HMAC через gateway; подпись проверяет API. Успешный `receipt.accept` отвечает HTTP `200` после сохранения Inbox; adapter возвращает ответ API.
 * **Reconciler:** опрашивает `inbox` и применяет ответы провайдеров к внутренним стейт-машинам через `delivery.reconcile_inbox`.
 
-* **Reconciler:** опрашивает `inbox` и применяет ответы провайдеров к внутренним стейт-машинам через `delivery.reconcile_inbox`.
-
 ### Provider-simulator
 
 Официальный `v0.2.0` образ провайдера (имитатора внешнего API). Ожидает HTTP POST запросы с заголовками `Idempotency-Key` (соответствует `externalRequestId`) и `X-Correlation-ID`. Поддерживает механизм retry policy. Audit API защищен `PROVIDER_AUDIT_TOKEN` для проверки авточекером.
 
 Успешный ответ provider — HTTP `202` со строгим JSON body. Transport errors, `408`, `429`, `5xx` допускают retry по policy БД; некорректный body при `202` — terminal error. Outbox допускает повторные HTTP attempts, provider дедуплицирует payment. Точные bytes/headers и правила повторов — во внешнем контракте.
 
+Политика повторов Outbox в БД: первая попытка и до трёх повторов с задержками **200, 400 и 800 мс**. После retryable-ошибки четвёртой попытки или любой terminal-ошибки запись переходит в `DEAD`. Эти значения используются в обоих профилях и соответствуют [уточнённому тестовому профилю недели 3](https://github.com/fintech-dev-lab/moduledev-week-3-python-perimeter-task/blob/563e2fcf5ada68e71e88675fc7740ab81083126d/docs/07-autocheck-outline.md#тестовый-профиль). Задержка задаёт время доступности следующего claim; фактическая отправка также зависит от poll interval dispatcher.
+
 ### Проверка
 
-Автоматические проверки создают тестовое окружение, поднимают Compose и проверяют контракты. 
-Поскольку проверочные скрипты не входят в репозиторий решения, для проверки необходимо склонировать оригинальные репозитории заданий и запустить скрипты из них, передав путь к вашему решению через флаг `--repo`.
+Локальный [wrapper](scripts/check.py) проверяет, что в `scripts/repo/` лежит репозиторий нужной недели с закреплённым commit, и запускает `public_check.py`. Автоматически клонировать он не умеет — нужно сделать это вручную один раз (шаг 1 ниже). Папка `scripts/repo/` исключена из Git и Docker build context.
+
+Нужны Python 3.10+, Git, Bash, Docker и Compose v2.
+
+
+Закреплённые версии:
+
+| Неделя | Репозиторий | Commit |
+|---|---|---|
+| 1 | [moduledev-week-1-gateway-task](https://github.com/fintech-dev-lab/moduledev-week-1-gateway-task/tree/51fbca54412ceb42964048fb0b19354d51488a22) | `51fbca54412ceb42964048fb0b19354d51488a22` |
+| 2 | [moduledev-week-2-workflow-task](https://github.com/fintech-dev-lab/moduledev-week-2-workflow-task/tree/0db15e2ee8e6722369425439cc44946d9a049bd5) | `0db15e2ee8e6722369425439cc44946d9a049bd5` |
+| 3 | [moduledev-week-3-python-perimeter-task](https://github.com/fintech-dev-lab/moduledev-week-3-python-perimeter-task/tree/563e2fcf5ada68e71e88675fc7740ab81083126d) | `563e2fcf5ada68e71e88675fc7740ab81083126d` |
+
+**Шаг 1 — склонировать checker-репозитории (один раз):**
 
 ```bash
-# Клонируем исходные репозитории заданий
-git clone https://github.com/fintech-dev-lab/moduledev-week-1-gateway-task
-git clone https://github.com/fintech-dev-lab/moduledev-week-2-workflow-task
-git clone https://github.com/fintech-dev-lab/moduledev-week-3-python-perimeter-task
+# Неделя 1
+git clone --config core.autocrlf=false https://github.com/fintech-dev-lab/moduledev-week-1-gateway-task.git scripts/repo/moduledev-week-1-gateway-task
+git -C scripts/repo/moduledev-week-1-gateway-task checkout 51fbca54412ceb42964048fb0b19354d51488a22
 
-# Запуск авточека Недели 1 (или ./check.sh --repo . из папки задания)
-python3 moduledev-week-1-gateway-task/autocheck/public_check.py --repo . --fixtures moduledev-week-1-gateway-task/autocheck/fixtures --output week-1-public-report.json
+# Неделя 2
+git clone --config core.autocrlf=false https://github.com/fintech-dev-lab/moduledev-week-2-workflow-task.git scripts/repo/moduledev-week-2-workflow-task
+git -C scripts/repo/moduledev-week-2-workflow-task checkout 0db15e2ee8e6722369425439cc44946d9a049bd5
 
-# Запуск авточека Недели 2 (или ./check.sh --repo . из папки задания)
-python3 moduledev-week-2-workflow-task/autocheck/public_check.py --repo . --fixtures moduledev-week-2-workflow-task/autocheck/fixtures --output week-2-public-report.json --compose-wrapper moduledev-week-2-workflow-task/autocheck/safe_compose.sh
-
-# Запуск авточека Недели 3
-./moduledev-week-3-python-perimeter-task/check.sh --repo .
+# Неделя 3
+git clone --config core.autocrlf=false https://github.com/fintech-dev-lab/moduledev-week-3-python-perimeter-task.git scripts/repo/moduledev-week-3-python-perimeter-task
+git -C scripts/repo/moduledev-week-3-python-perimeter-task checkout 563e2fcf5ada68e71e88675fc7740ab81083126d
 ```
 
-Отчёты о проверке (`week-X-public-report.json`) автоматически сохраняются в корневой директории вашего проекта. Для сохранения тестового стека после проверки можно добавить `--keep-stack`. Коды завершения: `0` — проверки пройдены, `1` — есть нарушения контракта, `2` — ошибка запуска checker или окружения.
+
+**Шаг 2 — запустить полную проверку (требуется Docker):**
+
+Linux/macOS/WSL:
+
+```bash
+bash ./check.sh --week 1
+bash ./check.sh --week 2
+bash ./check.sh --week 3
+```
+
+Windows PowerShell:
+
+```powershell
+.\check.ps1 -week 1
+.\check.ps1 -week 2
+.\check.ps1 -week 3
+```
+
+PowerShell wrapper автоматически выбирает единственный установленный дистрибутив WSL, исключая служебные `docker-desktop` и `docker-desktop-data`. При нескольких дистрибутивах укажите нужный явно, например `.\check.ps1 -week 3 -distro Debian`; список — `wsl --list --verbose`. В выбранном дистрибутиве должны быть Python 3.10+, Git, Bash и `docker compose`; для Docker Desktop включите WSL integration. Пути переводятся через `wslpath`.
+
+По умолчанию оба wrapper запускают неделю 3. Отчёты `week-X-public-report.json` сохраняются в корне решения, commit checker печатается перед запуском. Для сохранения стека используйте `--keep-stack` / `-keepStack`. Wrapper передаёт exit code checker (`0` — успех, `1` — нарушения, `2` — ошибка checker/окружения).
+
+Для другого решения используйте `bash ./check.sh --week 3 --repo /path/to/solution`. Checker ищется в `scripts/repo/` относительно расположения wrapper; изменить путь можно через `--checkers-dir`. При несовпадении commit или локальных изменениях в checkout запуск останавливается. Wrapper вызывает официальный Python entrypoint: shell wrapper недели 2 не позволяет передать внешний `--repo`.
+
+
 
 **Собственные регрессии workflow и PostgreSQL:**
 
@@ -207,7 +253,11 @@ python3 moduledev-week-2-workflow-task/autocheck/public_check.py --repo . --fixt
 python src/Tests/workflow_regression.py
 ```
 
-Набор создаёт отдельный Compose project без опубликованных портов и удаляет его контейнеры и volume после проверки. Проверяются обновление БД с миграций `001..010` на `011`, повторное применение миграций, неизменяемость опубликованных карт, переключение активной версии, конкурирующие claim, устаревший finish, retry после STALE, повтор/конфликт сигнала, mapping отсутствующего значения и JSON null, права worker и восстановление после остановки между action и finish. Проверки сверяют состояние БД, историю, идентификаторы и число предметных эффектов. Публичные autocheck этот набор не заменяет.
+Набор создаёт отдельный Compose project без опубликованных портов и удаляет его контейнеры и volume после проверки. Проверяются обновление БД с миграций `001..010` через `011/012/013`, повторное применение миграций, неизменяемость опубликованных карт, переключение активной версии, конкурирующие claim, устаревший finish, retry после STALE, повтор/конфликт сигнала, mapping отсутствующего значения и JSON null, права worker и восстановление после остановки между action и finish.
+
+Проверка политики Outbox вызывает production-функции под ролью `outbox_dispatcher`: четыре попытки, точные интервалы 200/400/800 мс, запрет раннего claim, успех на четвёртой попытке, исчерпание повторов, немедленный `DEAD` при terminal error и защита от неверного owner/stale lease/изменения `CONFIRMED`. SQL fixture откатывается; ожидание задержек заменено изменением `next_attempt_at` в тестовой БД.
+
+Регрессии недели 3 проверяют сохранность legacy events при обновлении, канонические имена в таблице и публичных чтениях, rollback submit, 20 конкурентных submit с одинаковыми/разными ключами, финалы по receipt и auto/manual decision. SQL fixture проверяет предметную границу; JWT/HMAC и provider HTTP проверяет внешний checker. Реальный worker проверяется на полный trusted context, независимость от одноимённых полей payload, JSON-цепочки attempts, отсутствие чувствительных сообщений в логах и rollback некорректного `result=null`. Команды не запускаются автоматически при сборке приложения.
 
 Локальные unit-тесты C# (требуется .NET SDK 10):
 
@@ -215,7 +265,7 @@ python src/Tests/workflow_regression.py
 dotnet test src/Tests/Tests.csproj -c Release
 ```
 
-Unit-тесты Python receipt: `python -m unittest discover -s src/Python/tests`. Команды в README не означают, что последняя редакция уже протестирована.
+Unit-тесты Python receipt: `python -m unittest discover -s src/Python/tests`. Проверки wrapper без сети/Docker: `python -m unittest discover -s scripts/tests`. Команды в README не означают, что последняя редакция уже протестирована.
 
 Миграция `011_workflow_invariants.sql` защищает опубликованные карты и исправляет расход retry budget: STALE сохраняется в истории, но не считается ошибкой исполнения. Порядок обновления и ограничение для переименованной `008` описаны в разделе «Миграции». Права `workflow-worker` (`workflow:execute`, `payment:internal`) заданы независимо от policy действий и проверяются при публикации карты и исполнении задания.
 
@@ -226,12 +276,14 @@ Unit-тесты Python receipt: `python -m unittest discover -s src/Python/tests
 - **Liveness Gateway:** `curl http://localhost:8080/health/live` (проверка, что процесс не завис).
 - **Readiness API:** `curl http://localhost:8080/health/ready` — gateway обращается к API, API проверяет наличие `catalog.actions` и `api.invoke` в БД. Это не проверка всех миграций, provider или Python-сервисов.
 - **Динамический OpenAPI:** `curl http://localhost:8080/openapi/default.json` (API на лету генерирует swagger.json на основе манифестов из `catalog.actions`).
-- **Логи:** gateway/API и Python используют JSON; C# worker также пишет текстовые сообщения. Не включайте секреты и полные payload в диагностические отчёты.
+- **Логи:** gateway/API, Python и C# worker используют JSON. Worker пишет `worker.claim`, `worker.invoke`, `worker.finish`, `worker.fail`, `worker.retry`, `worker.stale` с `timestamp`, `instanceId`, `processId`, `jobId`, `executionId`, `attemptId`, `leaseVersion`, `outcome`, `errorCode`, `jobState`. События уровня процесса (`worker.started` и другие) имеют `null` вместо IDs задания. Payload, SQL exception text и target message в worker-логи не включаются.
   ```bash
   docker compose logs -f api
   docker compose logs -f worker-a
   docker compose logs -f outbox-dispatcher receipt-adapter inbox-reconciler
   ```
+
+`worker.claim` следует за подтверждённым claim; `worker.invoke` означает начало вызова, а не commit. `worker.finish` появляется только после commit action/finish. `worker.fail` отражает подтверждённый `fail_job`; `worker.retry` дополнительно появляется при фактическом `RETRY_WAIT`. `worker.stale` означает отказ устаревшей попытке. `worker.fail_unconfirmed` сообщает, что запись результата fail_job не подтверждена; `worker.abandoned`/`worker.interrupted` требуют сверки с БД и последующим reclaim. По `attemptId` и `leaseVersion` сопоставляйте цепочку с `autocheck.attempts`. Логи не атомарны с commit и не заменяют durable историю. Формат `failpoint.reached` сохранён.
 
 ### Ограничения
 

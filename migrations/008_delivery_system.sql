@@ -90,7 +90,7 @@ BEGIN
         UPDATE payment.operations SET status='PROCESSING', process_id=v_op.process_id, updated_at=now()
         WHERE operation_id=v_op.operation_id;
         INSERT INTO payment.operation_events(operation_id,event_type,payload_hash)
-        VALUES(v_op.operation_id,'OperationSubmitted',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
+        VALUES(v_op.operation_id,'OPERATION_SUBMITTED',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
     END IF;
     SELECT * INTO v_process FROM workflow.process_instances WHERE process_id=v_op.process_id;
     RETURN jsonb_build_object('status','ok','outcome','SUBMITTED','result',jsonb_build_object(
@@ -179,7 +179,7 @@ BEGIN
     WHERE operation_id=v_op.operation_id AND status='PROCESSING';
     IF FOUND THEN
         INSERT INTO payment.operation_events(operation_id,event_type,payload_hash)
-        VALUES(v_op.operation_id,'OperationCompleted',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
+        VALUES(v_op.operation_id,'OPERATION_COMPLETED',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
     END IF;
     RETURN jsonb_build_object('status','ok','outcome','COMPLETED','result','{}'::jsonb);
 END;
@@ -198,7 +198,7 @@ BEGIN
     WHERE operation_id=v_op.operation_id AND status='PROCESSING';
     IF FOUND THEN
         INSERT INTO payment.operation_events(operation_id,event_type,payload_hash)
-        VALUES(v_op.operation_id,'OperationRejected',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
+        VALUES(v_op.operation_id,'OPERATION_REJECTED',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
     END IF;
     RETURN jsonb_build_object('status','ok','outcome','REJECTED','result','{}'::jsonb);
 END;
@@ -216,7 +216,7 @@ BEGIN
     WHERE operation_id=v_op.operation_id AND status='PROCESSING';
     IF FOUND THEN
         INSERT INTO payment.operation_events(operation_id,event_type,payload_hash)
-        VALUES(v_op.operation_id,'OperationCompleted',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
+        VALUES(v_op.operation_id,'OPERATION_COMPLETED',encode(sha256(convert_to(p_payload::text,'UTF8')),'hex'));
     END IF;
     RETURN jsonb_build_object('status','ok','outcome','COMPLETED','result','{}'::jsonb);
 END;

@@ -13,3 +13,4 @@ __pycache__/
 *.log
 week-*-public-report.json
 AGENTS/
+scripts/repo/
