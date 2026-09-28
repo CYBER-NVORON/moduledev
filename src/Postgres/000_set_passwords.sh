@@ -14,7 +14,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
   -v mig_pass="$COURSE_MIGRATOR_PASSWORD" \
   -v wkr_pass="$COURSE_WORKER_PASSWORD" \
   -v out_pass="$COURSE_OUTBOX_PASSWORD" \
-  -v in_pass="$COURSE_INBOX_PASSWORD" <<'EOSQL'
+  -v in_pass="$COURSE_INBOX_PASSWORD" \
+  -v check_pass="${COURSE_AUTOCHECK_PASSWORD:-}" <<'EOSQL'
     CREATE ROLE course_owner NOLOGIN;
     CREATE ROLE course_runtime LOGIN PASSWORD :'rt_pass';
     CREATE ROLE course_publication LOGIN PASSWORD :'pub_pass';
@@ -22,4 +23,5 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
     CREATE ROLE workflow_worker LOGIN PASSWORD :'wkr_pass';
     CREATE ROLE outbox_dispatcher LOGIN PASSWORD :'out_pass';
     CREATE ROLE inbox_reconciler LOGIN PASSWORD :'in_pass';
+    \i /opt/prepare_database.sql
 EOSQL

@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 
 def map_callback_to_receipt(callback: dict) -> dict:
+    # Provider operationId is our externalRequestId, not the internal payment operation UUID.
     return {
         "version": 1,
         "messageId": callback["providerPaymentId"],
@@ -15,6 +16,7 @@ def map_callback_to_receipt(callback: dict) -> dict:
     }
 
 def sign_receipt(receipt: dict, secret: str) -> tuple[bytes, str]:
+    # Return the wire bytes with the signature so callers do not serialize the body again.
     body_bytes = json.dumps(receipt, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode('utf-8')
     mac = hmac.new(secret.encode('utf-8'), body_bytes, hashlib.sha256)
     signature = f'v1={mac.hexdigest()}'

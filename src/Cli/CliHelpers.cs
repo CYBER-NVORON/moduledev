@@ -72,7 +72,7 @@ public static class CliHelpers
             return (false, msg, node);
         }
 
-        // Metaschema-validate and compile nested schemas to fail fast on invalid refs
+        // Parse both nested schemas before accepting the manifest.
         try
         {
             if (node["request_schema"] is JsonNode reqNode)

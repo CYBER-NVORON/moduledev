@@ -12,6 +12,7 @@ public static class JsonPointer
         var parts = pointer.Split('/');
         for (int i = 0; i < parts.Length; i++)
         {
+            // Decode ~1 first so the literal ~01 becomes ~1, not a slash.
             parts[i] = parts[i].Replace("~1", "/").Replace("~0", "~");
         }
         return parts;
@@ -19,6 +20,7 @@ public static class JsonPointer
 
     public static (bool found, JsonNode? value) TryGet(JsonNode? root, string pointer)
     {
+        // found distinguishes a missing path from a present JSON null.
         if (root is null) return (false, null);
         var segments = ParseSegments(pointer);
         if (segments.Length == 0) return (true, root);

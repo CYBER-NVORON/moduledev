@@ -93,7 +93,7 @@ public static class FlowValidator
                     }
                 }
 
-                // Check mapping & constants overlap
+                // Overlapping targets make the payload depend on assignment order.
                 var mapping = task["input_mapping"]?.AsObject();
                 var constants = task["input_constants"]?.AsObject();
 
@@ -348,7 +348,6 @@ public static class FlowValidator
                 return (false, $"step '{key}' missing module, action, or action_version");
             }
 
-            // Query catalog.actions
             await using var cmd = new NpgsqlCommand(
                 "SELECT enabled, outcomes, required_policy FROM catalog.actions WHERE module=@m AND action=@a AND version=@v", conn, tx);
             cmd.Parameters.AddWithValue("m", module);
@@ -359,7 +358,6 @@ public static class FlowValidator
             if (!await reader.ReadAsync())
             {
                 await reader.CloseAsync();
-                // Check if action exists under any version
                 await using var checkAnyCmd = new NpgsqlCommand(
                     "SELECT COUNT(*) FROM catalog.actions WHERE module=@m AND action=@a", conn, tx);
                 checkAnyCmd.Parameters.AddWithValue("m", module);

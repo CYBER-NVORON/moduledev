@@ -1,1 +1,10 @@
 scripts/repo/
+scripts/.regression-*/
+.git/
+AGENTS/
+**/bin/
+**/obj/
+**/__pycache__/
+.env
+.env.*
+week-*-public-report.json

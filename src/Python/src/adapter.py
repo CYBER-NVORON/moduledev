@@ -1,19 +1,18 @@
-import sys
 import json
 import logging
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import httpx
 from urllib.parse import urlparse
 
 import config
 from receipt import validate_callback, map_callback_to_receipt, sign_receipt
+from observability import ProbeHandler, Server, gateway_ready, log
 
-class AdapterHandler(BaseHTTPRequestHandler):
+class AdapterHandler(ProbeHandler):
     def log_message(self, format, *args):
         pass
 
     def do_POST(self):
-        # 1. Routing & Authorization Check
+        # The provider sends unsigned callbacks; the capability path is its access boundary.
         path = urlparse(self.path).path
         expected_path = f"/callbacks/provider-v02/{config.PROVIDER_CALLBACK_CAPABILITY}"
         
@@ -22,7 +21,6 @@ class AdapterHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
             
-        # 2. Extract and strictly validate payload
         content_length = self.headers.get('Content-Length')
         if not content_length:
             self.send_response(400)
@@ -45,13 +43,13 @@ class AdapterHandler(BaseHTTPRequestHandler):
         
         try:
             callback_data = validate_callback(body)
-        except ValueError as e:
-            logging.error(json.dumps({"error": str(e)}))
+        except ValueError:
+            log("receipt.invalid", "WARNING", errorCode="payload.invalid")
             self.send_response(400)
             self.end_headers()
             return
             
-        # 3. Transform to unified receipt format and compute HMAC signature
+        # Send these exact signed bytes; the API verifies HMAC before JSON parsing.
         receipt = map_callback_to_receipt(callback_data)
         body_bytes, signature = sign_receipt(receipt, config.PROVIDER_HMAC_SECRET)
         
@@ -63,31 +61,41 @@ class AdapterHandler(BaseHTTPRequestHandler):
             "X-Provider-Signature": signature
         }
         
-        # 4. Proxy authenticated request to the Receipt API
         try:
-            with httpx.Client(timeout=config.PROVIDER_TIMEOUT) as client:
+            # The provider attempt budget is for dispatcher delivery. The API
+            # needs its own timeout, including the first request after restart.
+            with httpx.Client(timeout=5.0) as client:
                 response = client.post(
                     config.RECEIPT_API_URL, 
                     content=body_bytes,
                     headers=headers
                 )
+                log("receipt.forwarded", "INFO" if response.is_success else "WARNING",
+                    messageId=receipt["messageId"], externalRequestId=receipt["externalRequestId"],
+                    requestId=receipt["messageId"], httpStatus=response.status_code)
                 self.send_response(response.status_code)
+                # httpx decodes response bodies; upstream length/encoding headers no longer apply.
                 for k, v in response.headers.items():
                     if k.lower() not in ('content-length', 'content-encoding', 'transfer-encoding'):
                         self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(response.content)
-        except httpx.RequestError as e:
+        except httpx.RequestError:
+            log("receipt.forward_failed", "WARNING", messageId=receipt["messageId"],
+                externalRequestId=receipt["externalRequestId"], errorCode="dependency.unavailable")
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "error", "code": "dependency.unavailable"}).encode('utf-8'))
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    # httpx INFO includes the target URL; do not log capability URLs or headers.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     port = 8082
-    server = ThreadingHTTPServer(('', port), AdapterHandler)
-    logging.info(json.dumps({"event": "adapter.started", "port": port}))
+    server = Server(('', port), AdapterHandler)
+    server.ready = gateway_ready
+    log("adapter.started", port=port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

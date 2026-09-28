@@ -13,12 +13,11 @@ var SchemaCache = new ConcurrentDictionary<string, JsonSchema>();
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Logging.ClearProviders().AddJsonConsole();
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 
 builder.WebHost.ConfigureKestrel(k => k.Limits.MaxRequestBodySize = 1_048_576); // 1 MB
 
-// --- JSON logging to stdout, no secrets ---
-
-// --- Configuration ---
+// Authentication configuration
 var jwtIssuer = builder.Configuration["COURSE_JWT_ISSUER"];
 var jwtAudience = builder.Configuration["COURSE_JWT_AUDIENCE"];
 var jwtSigningKey = builder.Configuration["COURSE_JWT_SIGNING_KEY"];
@@ -51,26 +50,9 @@ var providerHmacSecret = builder.Configuration["PROVIDER_HMAC_SECRET"] ?? "";
 
 var app = builder.Build();
 
-// --- Health ---
-app.MapGet("/health/live", () => Results.Ok(new { status = "ok", schema_cache_size = SchemaCache.Count }));
-app.MapGet("/health/ready", async () =>
-{
-    try
-    {
-        await using var conn = new NpgsqlConnection(dbConnection);
-        await conn.OpenAsync();
-        await using var cmd = new NpgsqlCommand("SELECT to_regclass('catalog.actions') IS NOT NULL AND to_regproc('api.invoke') IS NOT NULL", conn);
-        var ready = (bool)(await cmd.ExecuteScalarAsync() ?? false);
-        if (!ready) return Results.Json(new { status = "error", code = "dependency.unavailable", message = "migrations not applied" }, statusCode: 503);
-        return Results.Ok(new { status = "ok", schema_cache_size = SchemaCache.Count });
-    }
-    catch (Exception)
-    {
-        return Results.Json(new { status = "error", code = "dependency.unavailable", message = "database not ready" }, statusCode: 503);
-    }
-});
+Course.HealthEndpoints.Map(app, dbConnection, databaseMetrics: true);
 
-// --- OpenAPI ---
+// OpenAPI is generated from the published action catalog.
 app.MapGet("/openapi/default.json", async () =>
 {
     try
@@ -98,7 +80,7 @@ app.MapGet("/openapi/actions/{module}/{action}/{version}.json", async (string mo
     }
 });
 
-// --- Generic Action Route ---
+// Generic action dispatch: admission, SQL invocation and response validation.
 app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, string action) =>
 {
     if (!jwtConfigured)
@@ -111,24 +93,23 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
 
     try
     {
-        // 1. JWT Authentication
+        // Reject unauthenticated requests before reading the body.
         var authHeader = ctx.Request.Headers.Authorization.FirstOrDefault();
         string tokenStr = authHeader?.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) == true ? authHeader["Bearer ".Length..].Trim() : "";
         (principal, var consumer, var scopes, var authErr) = Api.ApiHelpers.ValidateJwt(tokenStr, tokenValidationParams, jwtHandler);
         if (authErr is not null)
             return await ErrorResultAsync(401, "auth.invalid", authErr);
 
-        // 2. Buffer the exact request bytes for hashing, signature verification and parsing.
+        // Hash and verify the original bytes; reserializing JSON would change the signature.
         ctx.Request.EnableBuffering();
         payloadHash = Convert.ToHexStringLower(await System.Security.Cryptography.SHA256.HashDataAsync(ctx.Request.Body, ctx.RequestAborted));
         ctx.Request.Body.Position = 0;
 
-        // 2.5. HMAC Signature Verification (X-Provider-Signature)
         bool? signatureVerified = null; // null = header absent, false = invalid, true = valid
         string? signatureHeader = ctx.Request.Headers["X-Provider-Signature"].FirstOrDefault();
         if (signatureHeader is not null)
         {
-            signatureVerified = false; // default: invalid unless proven otherwise
+            signatureVerified = false;
             if (!string.IsNullOrEmpty(providerHmacSecret)
                 && signatureHeader.StartsWith("v1=", StringComparison.Ordinal)
                 && signatureHeader.Length == 67
@@ -154,7 +135,6 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 return await ErrorResultAsync(401, "signature.invalid", "HMAC verification failed");
         }
 
-        // 3. Parse version header
         int? requestedVersion = null;
         if (ctx.Request.Headers.TryGetValue("X-Action-Version", out var versionHeader))
         {
@@ -180,7 +160,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
             return await ErrorResultAsync(400, "request.invalid", "invalid JSON body");
         }
 
-        // 4-10. Load the manifest and invoke the action in one transaction.
+        // Keep the action effect uncommitted until its outcome and response schema pass.
         try
         {
             await using var conn = new NpgsqlConnection(dbConnection);
@@ -189,7 +169,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
 
             try
             {
-                // 5. Read the current manifest on every request.
+                // Reload activation and policy on each request; only schemas are cached.
                 var manifest = await LoadManifest(module, action, requestedVersion, conn, tx);
 
                 if (manifest is null)
@@ -200,7 +180,6 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
 
                 actionVersion = manifest.Version;
 
-                // 6. Policy check (HTTP boundary)
                 foreach (var requiredScope in manifest.RequiredPolicy)
                 {
                     if (!scopes.Contains(requiredScope))
@@ -210,7 +189,6 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     }
                 }
 
-                // 7. Idempotency-Key check
                 var idempotencyKey = ctx.Request.Headers["Idempotency-Key"].FirstOrDefault();
                 if (manifest.IdempotencyMode == "required" && string.IsNullOrEmpty(idempotencyKey))
                 {
@@ -218,7 +196,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     return await ErrorResultAsync(400, "idempotency.required", "Idempotency-Key header is required");
                 }
 
-                // 8. Build server-side context
+                // Identity and signature status come from admission, never from payload fields.
                 var contextObj = new JsonObject
                 {
                     ["principal"] = principal,
@@ -238,7 +216,8 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 };
                 var context = contextObj;
 
-                // 8.5. Cross-version replay check (before schema validation)
+                // A retry without an explicit version must replay its original result,
+                // even if the current default version now has a different request schema.
                 if (requestedVersion is null && !string.IsNullOrEmpty(idempotencyKey))
                 {
                     await using var replayCmd = new NpgsqlCommand(
@@ -260,11 +239,11 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                         }
                         if (status == "error" && code == "receipt.signature_required")
                             return await ErrorResultAsync(403, code, "signature required");
+                        LogAction(replayNode?["outcome"]?.ToString(), result: replayNode?["result"]);
                         return Results.Json(replayNode, statusCode: 200);
                     }
                 }
 
-                // 9. Request schema validation
                 if (manifest.RequestSchema is not null)
                 {
                     var schemaResult = manifest.RequestSchema.Evaluate(payload, new EvaluationOptions
@@ -279,7 +258,6 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     }
                 }
 
-                // 10. Execute api.invoke (same conn/tx)
                 await using var cmd = new NpgsqlCommand(
                     "SELECT api.invoke(@module, @action, @version, @context::jsonb, @payload::jsonb)", conn, tx);
                 await using (var timeoutCmd = new NpgsqlCommand(
@@ -313,14 +291,12 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 var dbStatus = dbObject["status"]!.GetValue<string>();
                 var dbOutcome = dbObject["outcome"]?.GetValue<string>();
 
-                // If DB returned error -> ROLLBACK
                 if (dbStatus == "error")
                 {
                     await tx.RollbackAsync();
                     var errCode = dbObject["code"]!.GetValue<string>();
                     var errMsg = dbObject["message"]!.GetValue<string>();
 
-                    // Idempotency conflict and access.denied pass through with proper HTTP codes
                     var httpStatus = errCode switch
                     {
                         "idempotency.conflict" => 409,
@@ -331,6 +307,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                         "workflow.decision_conflict" => 409,
                         "action.not_found" => 404,
                         "operation.not_found" => 404,
+                        "diagnostics.trace_not_found" => 404,
                         "payload.invalid" => 422,
                         "auth.invalid" => 401,
                         "request.invalid" => 400,
@@ -344,12 +321,13 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
 
                     if (httpStatus >= 500)
                     {
-                        app.Logger.LogError("Target error hidden from client: {Code} - {Message}", errCode, errMsg);
+                        // Target messages are never written to application logs.
                         var safeCode = errCode == "action.contract_violation" ? "action.contract_violation" : "internal.error";
                         var safeMessage = errCode == "action.contract_violation" ? "contract violation" : "internal server error";
                         return await ErrorResultAsync(httpStatus, safeCode, safeMessage);
                     }
 
+                    LogAction(dbOutcome, errCode);
                     return Results.Json(new
                     {
                         status = "error",
@@ -370,17 +348,16 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 {
                     await tx.CommitAsync();
                     dbObject.Remove("__is_replay");
+                    LogAction(dbOutcome, result: dbObject["result"]);
                     return Results.Json(dbObject, statusCode: 200);
                 }
 
-                // Check outcome against manifest
                 if (dbOutcome is null || !manifest.Outcomes.Contains(dbOutcome))
                 {
                     await tx.RollbackAsync();
                     return await ErrorResultAsync(500, "action.contract_violation", $"unexpected outcome: {dbOutcome ?? "null"}");
                 }
 
-                // Validate result against response schema
                 var hasResult = dbObject.ContainsKey("result");
                 if (manifest.ResponseSchema is not null && !hasResult)
                 {
@@ -402,8 +379,14 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                     }
                 }
 
-                // All good -> COMMIT
+                // A crash here must roll back the decision and its workflow transition.
+                if (module == "workflow" && action == "manual")
+                    await PauseAtFailpoint("after_manual_decision");
                 await tx.CommitAsync();
+                LogAction(dbOutcome, result: dbObject["result"]);
+                // Inbox is durable before acknowledgement; replay can recover a lost HTTP response.
+                if (module == "receipt" && action == "accept")
+                    await PauseAtFailpoint("after_inbox_saved");
 
                 return Results.Json(dbObject, statusCode: 200);
             }
@@ -419,9 +402,9 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
                 throw;
             }
         }
-        catch (PostgresException pex)
+        catch (PostgresException)
         {
-            app.Logger.LogError(pex, "Database error in action {Module}.{Action}", module, action);
+            // Do not log Postgres detail, which can contain a payload or credentials.
             return await ErrorResultAsync(500, "internal.error", "internal server error");
         }
         catch (Exception ex) when (Api.ApiHelpers.IsTransientDatabaseError(ex))
@@ -429,16 +412,33 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
             return await ErrorResultAsync(503, "dependency.unavailable", "database unavailable");
         }
     }
-    catch (Exception ex)
+    catch (Exception)
     {
-        app.Logger.LogError(ex, "Unhandled error in action {Module}.{Action}", module, action);
+        // Exception messages may contain sensitive request data.
         return await ErrorResultAsync(500, "internal.error", "internal server error");
+    }
+
+    void LogAction(string? outcome, string? code = null, JsonNode? result = null)
+    {
+        var resultObject = result as JsonObject;
+        if (code is not null && (code.Length > 128 || !System.Text.RegularExpressions.Regex.IsMatch(code, @"\A[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\z")))
+            code = "internal.error";
+        Console.WriteLine(JsonSerializer.Serialize(new {
+            @event = "action.completed", timestamp = DateTime.UtcNow,
+            level = code is null ? "INFO" : code is "internal.error" or "dependency.unavailable" ? "ERROR" : "WARNING", service = "api", correlationId,
+            requestId = ctx.Request.Headers["Idempotency-Key"].FirstOrDefault(),
+            operationId = Guid.TryParse(resultObject?["operationId"]?.ToString(), out var oid) ? (Guid?)oid : null,
+            processId = Guid.TryParse(resultObject?["processId"]?.ToString(), out var pid) ? (Guid?)pid : null,
+            action = module + "." + action, actionVersion, outcome, errorCode = code,
+            durationMs = stopwatch.ElapsedMilliseconds
+        }));
     }
 
     async Task LogDispatchErrorAsync(string code, string? outcome)
     {
-        if (string.IsNullOrEmpty(principal)) return; // Don't log if we don't have a principal
-        if (string.IsNullOrEmpty(payloadHash)) return; // Pre-admission, don't log
+        // Persist only admitted requests. Use a separate connection because the action rolled back.
+        if (string.IsNullOrEmpty(principal)) return;
+        if (string.IsNullOrEmpty(payloadHash)) return;
         
         stopwatch.Stop();
         var reqId = ctx.Request.Headers["Idempotency-Key"].FirstOrDefault();
@@ -466,6 +466,7 @@ app.MapPost("/api/{module}/{action}", async (HttpContext ctx, string module, str
 
     async Task<IResult> ErrorResultAsync(int httpStatus, string code, string message, string? outcome = null)
     {
+        LogAction(outcome, code);
         await LogDispatchErrorAsync(code, outcome);
         return ErrorResult(httpStatus, code, message, correlationId, actionVersion);
     }
@@ -475,9 +476,8 @@ app.MapFallback((HttpContext ctx) =>
 {
     if (ctx.Request.Path.StartsWithSegments("/api"))
     {
-        // /api/{module}/{action} is the only valid pattern; check segment count
+        // Preserve 405 for a known route shape and 404 for malformed action paths.
         var segments = ctx.Request.Path.Value!.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        // segments: ["api", module, action] = 3 segments is a valid route, just wrong method
         if (segments.Length == 3)
             return ErrorResult(405, "request.invalid", "method not allowed", Guid.NewGuid().ToString(), null);
         return ErrorResult(404, "action.not_found", "route not found", Guid.NewGuid().ToString(), null);
@@ -487,9 +487,18 @@ app.MapFallback((HttpContext ctx) =>
 
 app.Run();
 
+async Task PauseAtFailpoint(string name)
+{
+    if (Environment.GetEnvironmentVariable("COURSE_TEST_PROFILE") != "1"
+        || Environment.GetEnvironmentVariable("COURSE_FAILPOINT") != name) return;
+    Console.WriteLine(JsonSerializer.Serialize(new { @event = "failpoint.reached", name, instanceId = "api" }));
+    Console.Out.Flush();
+    await Task.Delay(Timeout.Infinite, app.Lifetime.ApplicationStopping);
+}
 
 
-// --- Action Manifest Loading ---
+
+// Catalog access and schema compilation
 async Task<ActionManifest?> LoadManifest(string module, string action, int? version,
     NpgsqlConnection conn, NpgsqlTransaction tx)
 {
@@ -530,7 +539,7 @@ async Task<ActionManifest?> LoadManifest(string module, string action, int? vers
     }
 }
 
-// --- OpenAPI Builder ---
+// OpenAPI projection
 async Task<List<ActionInfo>> LoadActions(bool enabled = false, bool isDefault = false,
     string? module = null, string? action = null, int? version = null)
 {
@@ -591,7 +600,7 @@ object BuildOpenApiDoc(List<ActionInfo> actions, bool isVersionSpecific)
     };
 }
 
-// --- Envelope Helpers ---
+// HTTP envelopes
 IResult ErrorResult(int httpStatus, string code, string message, string? correlationId, int? actionVersion)
 {
     return Results.Json(ErrorEnvelope(code, message, correlationId, actionVersion), statusCode: httpStatus);
@@ -614,7 +623,6 @@ object ErrorEnvelope(string code, string message, string? correlationId, int? ac
 
 
 
-// --- Models ---
 
 public record ActionManifest(int Version, string TargetSchema, string TargetFunction, List<string> Outcomes, List<string> RequiredPolicy, string IdempotencyMode, string IdempotencyScope, int TimeoutMs, JsonSchema? RequestSchema, JsonSchema? ResponseSchema);
 

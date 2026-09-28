@@ -1,4 +1,6 @@
-# C4 Container Diagram
+# Архитектура контейнеров (C4)
+
+[Документация](README.md) · [Границы доверия](adr-trust-boundary.md)
 
 ## Контекст
 
@@ -16,13 +18,13 @@ C4Container
         Container(gateway, "Gateway", "C# ASP.NET Core", "Reverse proxy. Whitelist /api/, /openapi/, /health/. Порт 8080. Не имеет доступа к БД.")
         Container(api, "Api", "C# ASP.NET Core", "Generic action runtime. JWT auth, schema validation, api.invoke(), транзакционный контроль.")
         Container(cli, "Cli", "C# Console", "Публикация манифестов, workflow-карт, управление версиями.")
-        Container(dispatcher, "Outbox dispatcher", "Python 3.12", "Фиксированные SQL функции и provider HTTP.")
+        Container(dispatcher, "Outbox dispatcher × 2", "Python 3.12", "Фиксированные SQL функции и provider HTTP.")
         Container(adapter, "Receipt adapter", "Python 3.12", "Legacy callback → signed receipt; без БД.")
-        Container(reconciler, "Inbox reconciler", "Python 3.12", "Фиксированная функция reconciliation.")
-        Container(provider, "Provider v0.2.0", "Выданный image", "Idempotent payment и legacy callback.")
-        Container(worker_a, "Worker A", "C# Console", "Generic workflow executor. Polling, lease/fencing, claim_jobs -> api.invoke -> finish_job.")
-        Container(worker_b, "Worker B", "C# Console", "Generic workflow executor (конкурентный экземпляр).")
-        ContainerDb(postgres, "PostgreSQL 16", "PostgreSQL", "Авторитетное хранилище: catalog, idempotency, payment, workflow, receipt, delivery, autocheck. Бизнес-логика в PostgreSQL functions.")
+        Container(reconciler, "Inbox reconciler × 2", "Python 3.12", "Фиксированная функция reconciliation.")
+        Container(provider, "Provider v0.2.0", "HTTP simulator", "Idempotent payment и legacy callback.")
+        Container(worker_a, "Worker A", "C# ASP.NET Core", "Generic workflow executor. Polling, lease/fencing, claim_jobs -> api.invoke -> finish_job.")
+        Container(worker_b, "Worker B", "C# ASP.NET Core", "Generic workflow executor (конкурентный экземпляр).")
+        ContainerDb(postgres, "PostgreSQL 16", "PostgreSQL", "Авторитетное хранилище: catalog, idempotency, payment, workflow, receipt, delivery, diagnostics, autocheck. Бизнес-логика в PostgreSQL functions.")
     }
 
     Rel(client, gateway, "HTTP", "POST /api/{module}/{action}, GET /openapi/*, GET /health/*")
@@ -30,7 +32,7 @@ C4Container
     Rel(api, postgres, "TCP/Npgsql", "SELECT api.invoke(...), SELECT catalog.actions")
     Rel(worker_a, postgres, "TCP/Npgsql", "SELECT workflow.claim_jobs, api.invoke, workflow.finish_job, workflow.fail_job")
     Rel(worker_b, postgres, "TCP/Npgsql", "SELECT workflow.claim_jobs, api.invoke, workflow.finish_job, workflow.fail_job")
-    Rel(cli, postgres, "TCP/Npgsql", "INSERT catalog.actions, workflow.start_process, etc.")
+    Rel(cli, postgres, "TCP/Npgsql", "catalog.publish_action, публикация workflow-карт, workflow.start_process")
     Rel(cli, postgres, "TCP/Npgsql", "Проверка и применение миграций при запуске")
     Rel(dispatcher, postgres, "SQL", "claim_outbox / succeed_outbox / fail_outbox")
     Rel(dispatcher, provider, "HTTP", "POST /payments")
@@ -45,14 +47,16 @@ C4Container
 2. **Workflow Worker**: Worker (A/B) → PostgreSQL (отдельная короткая транзакция `claim_jobs`, затем общая транзакция `api.invoke` + validation + `finish_job`; при rollback — отдельный `fail_job`)
 3. **Publication & CLI**: Cli → PostgreSQL (`catalog.actions`, `workflow.flow_versions`, `workflow.start_process`)
 4. **Migration**: Cli → PostgreSQL (миграции)
-5. **Health**: Client → Gateway `/health/ready` → Api `/health/ready` → PostgreSQL (проверка готовности каталога и функций `catalog.actions` / `api.invoke`)
+5. **Health**: Client → Gateway `/health/ready` → Api `/health/ready` → PostgreSQL (соединение и наличие `autocheck.metrics`)
 6. **OpenAPI**: Client → Gateway `/openapi/*` → Api → PostgreSQL `catalog.actions`
 
 ## Сетевая изоляция
 
 - Gateway — единственный контейнер с опубликованным host-портом (`8080`), подключен к `gateway-net`.
 - Api подключен к `gateway-net` (для приема трафика от Gateway) и `course-net` (для взаимодействия с PostgreSQL).
-- Cli, PostgreSQL, Worker-A/B, Outbox-dispatcher и Inbox-reconciler доступны только внутри Docker network `course-net`.
+- Cli, PostgreSQL, Worker-A/B, обе реплики Outbox-dispatcher и обе реплики Inbox-reconciler доступны только внутри Docker network `course-net`.
 - Receipt-adapter изолирован в `gateway-net` и не имеет прямого доступа к PostgreSQL.
 - Provider подключён к обеим сетям: принимает запросы dispatcher и отправляет callback adapter. Host-портов у него нет.
 - Gateway не имеет credentials к PostgreSQL и не выполняет SQL.
+
+API, workers и пять Python-процессов предоставляют внутренние health/metrics. Trace и stalled исполняются в PostgreSQL через обычные manifests. Детали — в [runbook](reliability.md).

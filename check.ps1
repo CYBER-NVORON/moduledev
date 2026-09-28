@@ -1,5 +1,5 @@
 param(
-    [ValidateSet(1, 2, 3)] [int] $Week = 3,
+    [ValidateSet(1, 2, 3, 4)] [int] $Week = 4,
     [switch] $KeepStack,
     [string] $Distro
 )
@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 try {
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-        throw 'WSL is required. Install a Linux distribution with Python 3.10+, Git, Bash and Docker Compose access.'
+        throw 'WSL is required. Install a Linux distribution with Python 3.11+, Git, Bash, psql and Docker Compose access.'
     }
     $distributionOutput = & wsl.exe --list --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Cannot list WSL distributions.' }
@@ -29,8 +29,13 @@ try {
     $wslArguments = @('--distribution', $Distro)
     & wsl.exe @wslArguments --exec sh -c 'command -v bash >/dev/null 2>&1'
     if ($LASTEXITCODE -ne 0) { throw "Bash is unavailable in '$Distro'. Install Bash there or select another -Distro." }
-    $linuxRoot = & wsl.exe @wslArguments --exec wslpath -a -u $PSScriptRoot
+    # Resolve the drive root first: Docker Desktop bind mounts can make wslpath
+    # return an ephemeral /mnt/wsl/docker-desktop-bind-mounts path for the full directory.
+    $driveRoot = [System.IO.Path]::GetPathRoot($PSScriptRoot)
+    $linuxDrive = & wsl.exe @wslArguments --exec wslpath -a -u $driveRoot
     if ($LASTEXITCODE -ne 0) { throw "Cannot resolve the solution path in WSL distribution '$Distro'." }
+    $relativeRoot = $PSScriptRoot.Substring($driveRoot.Length).Replace('\', '/')
+    $linuxRoot = "$($linuxDrive.Trim().TrimEnd('/'))/$relativeRoot"
     Write-Host "Checker WSL distribution: $Distro"
     $checkerArguments = $wslArguments + @('--exec', 'bash', "$($linuxRoot.Trim())/check.sh", '--week', "$Week")
     if ($KeepStack) { $checkerArguments += '--keep-stack' }

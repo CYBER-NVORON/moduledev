@@ -1,5 +1,7 @@
 # Локальные JWT и HTTP-запросы
 
+[Документация](README.md) · [Настройка стенда](../README.md#запуск) · [Trace и stalled](reliability.md#trace-и-stalled)
+
 Это инструкция для ручной работы со стендом. Авточекеры сами создают synthetic secrets и токены, `.env` им не требуется. Исходный HTTP-контракт описан в документации, формы payload — в [contracts/course-1](../contracts/course-1).
 
 ## Настройка
@@ -56,9 +58,10 @@ print(unsigned + "." + encode(signature))
 python <path>/make_token.py receipt-provider integration receipt:write
 python <path>/make_token.py candidate-client web "payment:write payment:read workflow:read"
 python <path>/make_token.py reviewer backoffice "workflow:manual payment:read"
+python <path>/make_token.py diagnostician backoffice diagnostics:read
 ```
 
-Первый результат вставьте в `PROVIDER_CALLBACK_TOKEN` в `.env`. Два других используйте как `<CLIENT_JWT>` и `<REVIEWER_JWT>` в запросах. Не коммитьте эти значения. Токены действуют сутки; после замены callback token или других настроек выполните `docker compose up -d --build`, чтобы контейнеры получили новое окружение.
+Первый результат вставьте в `PROVIDER_CALLBACK_TOKEN` в `.env`. Следующие два используйте как `<CLIENT_JWT>` и `<REVIEWER_JWT>` в запросах. Не коммитьте эти значения. Токены действуют сутки; после замены callback token или других настроек выполните `docker compose up -d --build`, чтобы контейнеры получили новое окружение.
 
 ## Создание и запуск payment
 
@@ -113,3 +116,7 @@ curl -X POST http://localhost:8080/api/workflow/manual -H "Authorization: Bearer
 Для отказа используется `REJECTED`. Amount до `100000.00 RUB` включительно в `payment-review` проходит автоматическую ветку. Principal ручного решения берётся из JWT, его нельзя назначить полем payload.
 
 Для новой команды используйте новый `Idempotency-Key`; для проверки replay отправьте прежние key и body. Изменённый body с прежним key вызывает conflict. Callback обычно отправляет provider; ручная отправка receipt дополнительно требует HMAC exact body bytes по внешнему контракту.
+
+## Диагностические запросы
+
+Токен со scope `diagnostics:read`, выпущенный в разделе «Настройка», используется для [trace и stalled](reliability.md#trace-и-stalled). Там приведены payload, HTTP-команды и трактовка результата; порядок восстановления после сбоя описан в том же runbook.

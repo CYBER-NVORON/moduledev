@@ -1,117 +1,88 @@
+import asyncio
 import json
-import os
-import sys
 import time
-import uuid
-import logging
 import psycopg2
 import httpx
-
 import config
 from receipt import classify_provider_response
+from observability import log, failpoint, start_probes
 
-def setup_logging():
-    logger = logging.getLogger("dispatcher")
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(message)s'))
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
 
-logger = setup_logging()
-
-def handle_failpoint(point_name: str, instance_id: str):
-    failpoint = os.environ.get("COURSE_FAILPOINT")
-    if failpoint == point_name:
-        logger.info(json.dumps({
-            "event": "failpoint.reached",
-            "name": point_name,
-            "instanceId": instance_id
-        }))
-        while True:
-            time.sleep(999999)
-
-def main():
-    instance_id = str(uuid.uuid4())
-    logger.info(json.dumps({"event": "dispatcher.started", "instanceId": instance_id}))
-
+async def main():
+    start_probes()
+    log("dispatcher.started", instanceId=config.OUTBOX_OWNER)
     conn = None
-    while conn is None:
-        try:
-            conn = psycopg2.connect(config.DATABASE_URL)
-            conn.autocommit = True
-        except psycopg2.Error:
-            time.sleep(1)
-    
     while True:
         try:
-            # 1. Claim pending outbox records from PostgreSQL (Skip Locked)
-            with conn.cursor() as cur:
-                cur.execute("SELECT outbox_id, lease_version, external_request_id, correlation_id, amount, currency FROM delivery.claim_outbox(%s, %s)", (config.OUTBOX_OWNER, 1))
-                rows = cur.fetchall()
-                
-            if not rows:
-                time.sleep(config.POLL_INTERVAL)
-                continue
-                
-            handle_failpoint("after_outbox_claim", instance_id)
-            
-            # 2. Dispatch claimed records to the external provider
-            for row in rows:
-                outbox_id, lease_version, external_request_id, correlation_id, amount, currency = row
-                
-                headers = {
-                    "Content-Type": "application/json",
-                    "Idempotency-Key": external_request_id,
-                    "X-Correlation-ID": str(correlation_id)
-                }
-                
-                payload = {
-                    "operationId": external_request_id,
-                    "amount": str(amount),
-                    "currency": currency
-                }
-                
-                status_to_report = None
-                provider_payment_id = None
-                
-                try:
-                    with httpx.Client(timeout=config.PROVIDER_TIMEOUT) as client:
-                        response = client.post(f"{config.PROVIDER_URL}/payments", content=json.dumps(payload, separators=(',', ':')).encode('utf-8'), headers=headers)
-                        
-                        handle_failpoint("after_provider_response", instance_id)
-                        
-                        status_to_report, provider_payment_id = classify_provider_response(
-                            response.status_code, response.content)
-                except httpx.RequestError:
-                    handle_failpoint("after_provider_response", instance_id)
-                    status_to_report = "transport.error.retryable"
-                    
-                # 3. Classify response and record decision back in PostgreSQL
-                with conn.cursor() as cur:
-                    if status_to_report == "success":
-                        cur.execute("SELECT delivery.succeed_outbox(%s, %s, %s, %s)", 
-                                    (outbox_id, config.OUTBOX_OWNER, lease_version, provider_payment_id))
-                    else:
-                        cur.execute("SELECT delivery.fail_outbox(%s, %s, %s, %s)", 
-                                    (outbox_id, config.OUTBOX_OWNER, lease_version, status_to_report))
-                        
-        except psycopg2.Error as e:
-            logger.error(json.dumps({"event": "db.error", "errorType": type(e).__name__}))
-            time.sleep(config.POLL_INTERVAL)
-            try:
-                conn.close()
-            except:
-                pass
-            try:
-                conn = psycopg2.connect(config.DATABASE_URL)
+            if conn is None:
+                conn = psycopg2.connect(config.DATABASE_URL, connect_timeout=2)
                 conn.autocommit = True
-            except:
-                pass
-        except Exception as e:
-            logger.error(json.dumps({"event": "dispatcher.error", "errorType": type(e).__name__}))
-            time.sleep(config.POLL_INTERVAL)
+            with conn.cursor() as cur:
+                cur.execute("SELECT outbox_id, lease_version, external_request_id, correlation_id, amount, currency FROM delivery.claim_outbox(%s,%s)", (config.OUTBOX_OWNER, 1))
+                rows = cur.fetchall()
+            # Autocommit has released the claim locks before any external HTTP request.
+            if not rows:
+                await asyncio.sleep(config.POLL_INTERVAL)
+                continue
+            for outbox_id, lease_version, external_id, correlation_id, amount, currency in rows:
+                fields = dict(outboxId=outbox_id, externalRequestId=external_id,
+                              correlationId=correlation_id, leaseVersion=lease_version, instanceId=config.OUTBOX_OWNER)
+                log("outbox.claimed", "INFO", **fields)
+                failpoint("after_outbox_claim", config.OUTBOX_OWNER)
+                started = time.monotonic()
+                http_status = None
+                provider_id = None
+                try:
+                    log("provider.request.sent", "INFO", **fields)
+                    async with httpx.AsyncClient(timeout=config.PROVIDER_TIMEOUT) as client:
+                        # The async deadline includes DNS; a synchronous resolver can outlive the lease.
+                        response = await asyncio.wait_for(client.post(config.PROVIDER_URL + "/payments",
+                            content=json.dumps({"operationId": external_id, "amount": str(amount), "currency": currency}, separators=(",", ":")).encode(),
+                            headers={"Content-Type": "application/json", "Idempotency-Key": external_id,
+                                     "X-Correlation-ID": str(correlation_id)}), timeout=config.PROVIDER_TIMEOUT)
+                    http_status = response.status_code
+                    log("provider.response.received", "INFO" if http_status < 400 else "WARNING",
+                        **fields, httpStatus=http_status, durationMs=int((time.monotonic()-started)*1000))
+                    outcome, provider_id = classify_provider_response(http_status, response.content)
+                    if outcome != "success":
+                        log("provider.request.failed", "WARNING", **fields, httpStatus=http_status,
+                            errorCode=outcome, durationMs=int((time.monotonic()-started)*1000))
+                except (httpx.RequestError, asyncio.TimeoutError):
+                    outcome = "transport.error.retryable"
+                    log("provider.request.failed", "WARNING", **fields, httpStatus=http_status,
+                        errorCode=outcome, durationMs=int((time.monotonic()-started)*1000))
+                failpoint("after_provider_response", config.OUTBOX_OWNER)
+                # SQL checks owner/version/expiry and preserves a receipt already marked CONFIRMED.
+                with conn.cursor() as cur:
+                    if outcome == "success":
+                        cur.execute("SELECT delivery.succeed_outbox(%s,%s,%s,%s)",
+                                    (outbox_id, config.OUTBOX_OWNER, lease_version, provider_id))
+                    else:
+                        cur.execute("SELECT delivery.fail_outbox(%s,%s,%s,%s)",
+                                    (outbox_id, config.OUTBOX_OWNER, lease_version, outcome))
+                    result = cur.fetchone()[0]
+                if not result["updated"]:
+                    log("outbox.stale", "WARNING", **fields, **result,
+                        httpStatus=http_status, durationMs=int((time.monotonic()-started)*1000))
+                elif result.get("state") == "DEAD":
+                    log("outbox.dead", "ERROR", **fields, **result,
+                        httpStatus=http_status, durationMs=int((time.monotonic()-started)*1000))
+                elif result.get("state") == "DELIVERED":
+                    log("outbox.delivered", "INFO", **fields, **result,
+                        httpStatus=http_status, durationMs=int((time.monotonic()-started)*1000))
+                elif result.get("state") == "RETRY_WAIT":
+                    log("outbox.retry.scheduled", "WARNING", **fields, **result,
+                        httpStatus=http_status, durationMs=int((time.monotonic()-started)*1000))
+        except psycopg2.Error:
+            log("dispatcher.database_error", "ERROR", errorCode="dependency.unavailable")
+            if conn is not None:
+                conn.close()
+                conn = None
+            await asyncio.sleep(config.POLL_INTERVAL)
+        except Exception:
+            log("dispatcher.error", "ERROR", errorCode="internal.error")
+            await asyncio.sleep(config.POLL_INTERVAL)
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    asyncio.run(main())

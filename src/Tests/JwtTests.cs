@@ -12,7 +12,7 @@ namespace Tests;
 
 public class JwtTests
 {
-    private const string TestKey = "this_is_a_very_long_test_signing_key_at_least_32_bytes";
+    private const string TestKey = "this_is_a_very_long_test_signing_key_at_least_32_bytes"; // Synthetic JWT fixture only. gitleaks:allow
     private readonly SymmetricSecurityKey _signingKey = new(Encoding.UTF8.GetBytes(TestKey));
 
     private TokenValidationParameters GetDefaultValidationParams(bool validateLifetime = true) => new()

@@ -1,4 +1,6 @@
-# ADR: Trust Boundary — изоляция Gateway от базы данных
+# ADR: границы доверия и изоляция Gateway от БД
+
+[Документация](README.md) · [Архитектура контейнеров](c4-containers.md)
 
 ## Статус
 
@@ -15,7 +17,7 @@
 Gateway выполняет только проксирование HTTP-запросов к внутреннему Api по Compose DNS. Gateway:
 
 - **не имеет** строки подключения к PostgreSQL;
-- **не имеет** доступа к JWT signing key;
+- не использует JWT signing key: переменная передаётся всем C# services по конфигурационному контракту недели 4, а JWT проверяет API;
 - **не выполняет** аутентификацию, авторизацию или бизнес-логику;
 - **не модифицирует** payload — только проксирует тело и контрактные заголовки (`Authorization`, `Idempotency-Key`, `X-Action-Version`, `X-Provider-Signature`).
 
@@ -41,6 +43,7 @@ Api не публикует host-порты; публичный клиент о�
 | `workflow_worker`   | `LOGIN`. Выполняет `workflow.claim_jobs`, `api.invoke`, `workflow.finish_job`, `workflow.fail_job`. Нет прямого DML к `payment.*` и `workflow.*`. |
 | `outbox_dispatcher` | `LOGIN`. Только `delivery.claim_outbox`, `delivery.succeed_outbox`, `delivery.fail_outbox`. |
 | `inbox_reconciler` | `LOGIN`. Только `delivery.reconcile_inbox`. |
+| `autocheck_reader` | `LOGIN`. Только `SELECT` безопасных views схемы `autocheck`; без членства в других ролях, прямых таблиц, application functions, CREATE и TEMP. |
 
 `course_runtime` не может напрямую INSERT/UPDATE/DELETE в `payment.operations` или `payment.operation_events` — только через `SECURITY DEFINER` функции, принадлежащие `course_owner`. `payment.operations` защищена триггерами неизменяемости и графом допустимых переходов статусов, а `payment.operation_events` является строго append-only.
 

@@ -1,4 +1,6 @@
-# ADR: Unified Response Envelope — технический и предметный результат
+# ADR: технический и предметный результат
+
+[Документация](README.md) · [HTTP-примеры](local-requests.md)
 
 ## Статус
 
@@ -43,6 +45,7 @@ Action runtime возвращает два типа результатов:
 | Отсутствующая подпись receipt | 403 | `error` | DB → Runtime |
 | Нет required scope                | 403  | `error`  | Runtime (C#)    |
 | Action не найден / disabled       | 404  | `error`  | Runtime (C#)    |
+| Неизвестный identifier trace | 404 | `error` | DB → Runtime (`diagnostics.trace_not_found`) |
 | Невалидный payload (schema)       | 422  | `error`  | Runtime (C#)    |
 | Idempotency conflict              | 409  | `error`  | DB → Runtime    |
 | Нарушение контракта ответа        | 500  | `error`  | Runtime (C#)    |
@@ -55,7 +58,7 @@ Action runtime возвращает два типа результатов:
 - **5xx** — инфраструктурная ошибка (contract violation, timeout, DB unavailable).
 - **200** — бизнес-логика выполнена, outcome входит в зарегистрированный список, result прошёл response schema validation, транзакция закоммичена.
 
-Envelope со `status=error` откатывает транзакцию и транслируется в HTTP 4xx/5xx. Для 5xx API скрывает target message и нормализует code; код/текст произвольной DB-ошибки не обещаны клиенту без изменений. Успешный `receipt.accept` возвращает HTTP `200`; HTTP `202` относится к внешнему provider `/payments`.
+Envelope со `status=error` откатывает транзакцию и транслируется в HTTP 4xx/5xx. Для 5xx API скрывает target message и возвращает безопасный code вместо произвольного текста DB-ошибки. Успешный `receipt.accept` возвращает HTTP `200`; HTTP `202` относится к внешнему provider `/payments`.
 
 ### Rollback contract
 

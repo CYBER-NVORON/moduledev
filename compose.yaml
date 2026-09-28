@@ -18,6 +18,10 @@ services:
     environment:
       ASPNETCORE_URLS: http://+:8080
       API_BACKEND_URL: http://api:8080
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
     depends_on:
       api:
         condition: service_started
@@ -44,18 +48,22 @@ services:
       COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
       COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=course_runtime;Password=${COURSE_RUNTIME_PASSWORD:-runtime_pass};MaxPoolSize=80
       PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
     depends_on:
       postgres:
         condition: service_healthy
     networks:
     - gateway-net
     - course-net
-
   cli:
     build:
       context: .
       dockerfile: src/Cli/Dockerfile
-    command: [migration, apply, /migrations]
+    command:
+    - migration
+    - apply
+    - /migrations
     read_only: true
     cap_drop:
     - ALL
@@ -70,6 +78,9 @@ services:
       COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=course_publication;Password=${COURSE_PUBLISHER_PASSWORD:-publication_pass}
       COURSE_MIGRATION_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=course_migration;Password=${COURSE_MIGRATOR_PASSWORD:-migration_pass}
       COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,8 +104,14 @@ services:
     environment:
       COURSE_WORKER_OWNER: worker-a
       COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${COURSE_WORKER_PASSWORD:-worker_pass}
-      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
+      ASPNETCORE_URLS: http://+:8080
+      COURSE_JOB_LEASE_MS: ${COURSE_JOB_LEASE_MS:-2000}
+      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-100}
     depends_on:
       postgres:
         condition: service_healthy
@@ -118,8 +135,14 @@ services:
     environment:
       COURSE_WORKER_OWNER: worker-b
       COURSE_DB_CONNECTION: Host=postgres;Port=5432;Database=course;Username=workflow_worker;Password=${COURSE_WORKER_PASSWORD:-worker_pass}
-      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
       COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_JWT_ISSUER: ${COURSE_JWT_ISSUER:-}
+      COURSE_JWT_AUDIENCE: ${COURSE_JWT_AUDIENCE:-}
+      COURSE_JWT_SIGNING_KEY: ${COURSE_JWT_SIGNING_KEY:-}
+      ASPNETCORE_URLS: http://+:8080
+      COURSE_JOB_LEASE_MS: ${COURSE_JOB_LEASE_MS:-2000}
+      COURSE_WORKER_POLL_MS: ${COURSE_WORKER_POLL_MS:-100}
     depends_on:
       postgres:
         condition: service_healthy
@@ -139,15 +162,38 @@ services:
       COURSE_WORKER_PASSWORD: ${COURSE_WORKER_PASSWORD:-worker_pass}
       COURSE_OUTBOX_PASSWORD: ${COURSE_OUTBOX_PASSWORD:-outbox_pass}
       COURSE_INBOX_PASSWORD: ${COURSE_INBOX_PASSWORD:-inbox_pass}
+      COURSE_AUTOCHECK_PASSWORD: ${COURSE_AUTOCHECK_PASSWORD:-}
+      COURSE_OUTBOX_MAX_ATTEMPTS: ${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+      COURSE_OUTBOX_BACKOFF_BASE_MS: ${COURSE_OUTBOX_BACKOFF_BASE_MS:-200}
+      COURSE_OUTBOX_BACKOFF_MAX_MS: ${COURSE_OUTBOX_BACKOFF_MAX_MS:-800}
+      COURSE_OUTBOX_JITTER_MAX_MS: ${COURSE_OUTBOX_JITTER_MAX_MS:-100}
+      COURSE_OUTBOX_LEASE_MS: ${COURSE_OUTBOX_LEASE_MS:-2000}
+      COURSE_JOB_LEASE_MS: ${COURSE_JOB_LEASE_MS:-2000}
     volumes:
     - course-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d course"]
+      test:
+      - CMD-SHELL
+      - pg_isready -h 127.0.0.1 -U postgres -d course
       interval: 2s
       timeout: 3s
       retries: 10
     networks:
     - course-net
+    command:
+    - postgres
+    - -c
+    - course.outbox_max_attempts=${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+    - -c
+    - course.outbox_backoff_base_ms=${COURSE_OUTBOX_BACKOFF_BASE_MS:-200}
+    - -c
+    - course.outbox_backoff_max_ms=${COURSE_OUTBOX_BACKOFF_MAX_MS:-800}
+    - -c
+    - course.outbox_jitter_max_ms=${COURSE_OUTBOX_JITTER_MAX_MS:-100}
+    - -c
+    - course.outbox_lease_ms=${COURSE_OUTBOX_LEASE_MS:-2000}
+    - -c
+    - course.job_lease_ms=${COURSE_JOB_LEASE_MS:-2000}
   outbox-dispatcher:
     build:
       context: src/Python
@@ -159,7 +205,13 @@ services:
       DATABASE_URL: postgresql://outbox_dispatcher:${COURSE_OUTBOX_PASSWORD:-outbox_pass}@postgres:5432/course
       PROVIDER_URL: ${PROVIDER_URL:-http://provider-simulator:8081}
       OUTBOX_OWNER: ${OUTBOX_OWNER:-outbox-dispatcher}
-      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_PROVIDER_TIMEOUT_MS: ${COURSE_PROVIDER_TIMEOUT_MS:-500}
+      COURSE_OUTBOX_POLL_MS: ${COURSE_OUTBOX_POLL_MS:-100}
+      COURSE_OUTBOX_MAX_ATTEMPTS: ${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+      COURSE_OUTBOX_LEASE_MS: ${COURSE_OUTBOX_LEASE_MS:-2000}
+      SERVICE_NAME: outbox-dispatcher
     depends_on:
       postgres:
         condition: service_healthy
@@ -178,6 +230,9 @@ services:
       PROVIDER_CALLBACK_TOKEN: ${PROVIDER_CALLBACK_TOKEN:-}
       PROVIDER_HMAC_SECRET: ${PROVIDER_HMAC_SECRET:-}
       RECEIPT_API_URL: ${RECEIPT_API_URL:-http://gateway:8080/api/receipt/accept}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      SERVICE_NAME: receipt-adapter
     networks:
     - gateway-net
     image: course-python:latest
@@ -190,7 +245,10 @@ services:
     - src/reconciler.py
     environment:
       DATABASE_URL: postgresql://inbox_reconciler:${COURSE_INBOX_PASSWORD:-inbox_pass}@postgres:5432/course
-      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_INBOX_POLL_MS: ${COURSE_INBOX_POLL_MS:-500}
+      SERVICE_NAME: inbox-reconciler
     depends_on:
       postgres:
         condition: service_healthy
@@ -206,6 +264,49 @@ services:
     networks:
     - course-net
     - gateway-net
+  outbox-dispatcher-b:
+    build:
+      context: src/Python
+      dockerfile: Dockerfile
+    command:
+    - python
+    - src/dispatcher.py
+    environment:
+      DATABASE_URL: postgresql://outbox_dispatcher:${COURSE_OUTBOX_PASSWORD:-outbox_pass}@postgres:5432/course
+      PROVIDER_URL: ${PROVIDER_URL:-http://provider-simulator:8081}
+      OUTBOX_OWNER: ${OUTBOX_OWNER_B:-outbox-dispatcher-b}
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_PROVIDER_TIMEOUT_MS: ${COURSE_PROVIDER_TIMEOUT_MS:-500}
+      COURSE_OUTBOX_POLL_MS: ${COURSE_OUTBOX_POLL_MS:-100}
+      COURSE_OUTBOX_MAX_ATTEMPTS: ${COURSE_OUTBOX_MAX_ATTEMPTS:-4}
+      COURSE_OUTBOX_LEASE_MS: ${COURSE_OUTBOX_LEASE_MS:-2000}
+      SERVICE_NAME: outbox-dispatcher-b
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+    - course-net
+    image: course-python:latest
+  inbox-reconciler-b:
+    build:
+      context: src/Python
+      dockerfile: Dockerfile
+    command:
+    - python
+    - src/reconciler.py
+    environment:
+      DATABASE_URL: postgresql://inbox_reconciler:${COURSE_INBOX_PASSWORD:-inbox_pass}@postgres:5432/course
+      COURSE_TEST_PROFILE: ${COURSE_TEST_PROFILE:-0}
+      COURSE_FAILPOINT: ${COURSE_FAILPOINT:-}
+      COURSE_INBOX_POLL_MS: ${COURSE_INBOX_POLL_MS:-500}
+      SERVICE_NAME: inbox-reconciler-b
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+    - course-net
+    image: course-python:latest
 volumes:
   course-data: null
 networks:

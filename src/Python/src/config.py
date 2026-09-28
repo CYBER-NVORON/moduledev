@@ -18,3 +18,8 @@ else:
     PROVIDER_TIMEOUT = 5.0
     INBOX_RECONCILIATION_POLL = 2.0
 
+# Millisecond configuration contract, with existing profile defaults as fallback.
+POLL_INTERVAL = max(1, int(os.environ.get("COURSE_OUTBOX_POLL_MS", POLL_INTERVAL * 1000))) / 1000
+PROVIDER_TIMEOUT = max(1, int(os.environ.get("COURSE_PROVIDER_TIMEOUT_MS", PROVIDER_TIMEOUT * 1000))) / 1000
+INBOX_RECONCILIATION_POLL = max(1, int(os.environ.get("COURSE_INBOX_POLL_MS", INBOX_RECONCILIATION_POLL * 1000))) / 1000
+

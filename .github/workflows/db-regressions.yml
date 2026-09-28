@@ -1,0 +1,22 @@
+name: Database regressions
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  database-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check wrapper preparation and validation
+        run: python3 -m unittest discover -s scripts/tests
+      - name: Run isolated PostgreSQL and worker regressions
+        run: python3 -u src/Tests/workflow_regression.py

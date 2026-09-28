@@ -82,10 +82,10 @@ async Task<int> MigrationApply(string connStr, string directory)
         var filename = Path.GetFileName(file)!;
         var rawContent = await File.ReadAllTextAsync(file);
         
+        // Match initdb's checksum on Windows and Linux without changing the SQL sent to PostgreSQL.
         var normalizedTemplate = rawContent.Replace("\r\n", "\n");
         var hash = CliHelpers.Sha256Hex(normalizedTemplate);
 
-        // Check if already applied
         string? existing = null;
         try
         {
@@ -111,7 +111,7 @@ async Task<int> MigrationApply(string connStr, string directory)
             continue;
         }
 
-        // Apply in its own transaction
+        // Commit the DDL and its ledger entry together so a failed file remains retryable.
         await using var tx = await conn.BeginTransactionAsync();
         try
         {
@@ -477,5 +477,4 @@ JsonObject Error(string code, string message) => new()
     ["message"] = message,
     ["meta"] = new JsonObject { ["contractVersion"] = "course-1" }
 };
-
 

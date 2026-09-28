@@ -238,7 +238,7 @@ public static class FlowCommands
 
         try
         {
-            // Validate actions in DB
+            // Validate the catalog references in the same transaction as publication.
             var (actionsOk, actionsErr) = await FlowValidator.ValidateActionsWithDb(mapNode, conn, tx);
             if (!actionsOk)
             {
@@ -247,13 +247,12 @@ public static class FlowCommands
                 return 1;
             }
 
-            // Check if flow definition exists, insert if not
             await using var defCmd = new NpgsqlCommand(
                 "INSERT INTO workflow.flow_definitions (flow_name) VALUES (@n) ON CONFLICT (flow_name) DO NOTHING", conn, tx);
             defCmd.Parameters.AddWithValue("n", flowName);
             await defCmd.ExecuteNonQueryAsync();
 
-            // Check if this version already exists
+            // Republish is allowed only for identical content; versions are immutable.
             await using var checkCmd = new NpgsqlCommand(
                 "SELECT map_hash FROM workflow.flow_versions WHERE flow_name = @n AND flow_version = @v", conn, tx);
             checkCmd.Parameters.AddWithValue("n", flowName);
@@ -264,7 +263,6 @@ public static class FlowCommands
             {
                 if (existingHash == mapHash)
                 {
-                    // Idempotent publish
                     await tx.CommitAsync();
                     WriteEnvelope(Ok(new JsonObject
                     {
@@ -283,7 +281,6 @@ public static class FlowCommands
                 }
             }
 
-            // Insert new version
             await using var insertCmd = new NpgsqlCommand(
                 "INSERT INTO workflow.flow_versions (flow_name, flow_version, map_json, map_hash, status, is_active) " +
                 "VALUES (@n, @v, @json::jsonb, @hash, 'PUBLISHED', false)", conn, tx);
@@ -355,7 +352,6 @@ public static class FlowCommands
 
         try
         {
-            // Verify version exists
             await using var checkCmd = new NpgsqlCommand(
                 "SELECT 1 FROM workflow.flow_versions WHERE flow_name = @n AND flow_version = @v", conn, tx);
             checkCmd.Parameters.AddWithValue("n", flowName);
@@ -369,13 +365,12 @@ public static class FlowCommands
                 return 1;
             }
 
-            // Deactivate existing active version
+            // Clear the old version before setting the new one to preserve the unique active index.
             await using var deactCmd = new NpgsqlCommand(
                 "UPDATE workflow.flow_versions SET is_active = false WHERE flow_name = @n AND is_active = true", conn, tx);
             deactCmd.Parameters.AddWithValue("n", flowName);
             await deactCmd.ExecuteNonQueryAsync();
 
-            // Activate target version
             await using var actCmd = new NpgsqlCommand(
                 "UPDATE workflow.flow_versions SET is_active = true WHERE flow_name = @n AND flow_version = @v", conn, tx);
             actCmd.Parameters.AddWithValue("n", flowName);

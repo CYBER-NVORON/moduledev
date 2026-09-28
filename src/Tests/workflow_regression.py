@@ -40,6 +40,8 @@ def wait_for(read, accept, timeout=30):
 class Regression:
     def __init__(self, directory):
         self.directory = directory
+        # Containers run as unprivileged users; tempfile defaults to owner-only access.
+        directory.chmod(0o755)
         self.project = "moduledev-regression-" + uuid.uuid4().hex[:10]
         self.workers = set()
         self.env = {k: v for k, v in os.environ.items()
@@ -71,7 +73,7 @@ class Regression:
 
     def run(self, args, data=None, ok=True, timeout=120):
         result = subprocess.run(args, input=data, text=True, encoding="utf-8",
-                                errors="replace", capture_output=True, cwd=ROOT,
+                                errors="replace", capture_output=True, cwd=ROOT.parent,
                                 env=self.env, timeout=timeout)
         if ok and result.returncode:
             raise AssertionError(f"Command failed: {args}\n{result.stdout}\n{result.stderr[-8000:]}")
@@ -140,7 +142,7 @@ class Regression:
     def invoke(self, module, action, payload, key=None, principal="regression-client", extra=None):
         context = {"principal": principal, "consumer": "regression", "requestId": key or uuid.uuid4().hex,
                    "correlationId": str(uuid.uuid4()),
-                   "scopes": ["payment:write", "payment:read", "payment:internal", "workflow:manual", "receipt:write"]}
+                   "scopes": ["payment:write", "payment:read", "payment:internal", "workflow:manual", "receipt:write", "diagnostics:read"]}
         context.update(extra or {})
         return self.query(f"api.invoke({literal(module)}, {literal(action)}, 1, "
                           f"{literal(context)}::jsonb, {literal(payload)}::jsonb)", "course_runtime")
@@ -176,6 +178,8 @@ class Regression:
         assert "011_workflow_invariants.sql" in new
         assert "012_operation_event_contract.sql" in new
         assert "013_outbox_retry_policy.sql" in new
+        assert "014_outbox_reliability.sql" in new
+        assert "015_diagnostics.sql" in new
         assert history == self.query(f"jsonb_agg(to_jsonb(e) ORDER BY event_id) FROM payment.operation_events e "
                                      f"WHERE operation_id={literal(legacy)}")
         expected = sorted(["OPERATION_CREATED", "OPERATION_SUBMITTED", "OPERATION_COMPLETED", "OPERATION_REJECTED"])
@@ -289,6 +293,7 @@ class Regression:
         # rolled back; one transaction makes now() stable for exact delay assertions.
         self.sql("""BEGIN;
             SET LOCAL plpgsql.check_asserts = on;
+            SET LOCAL course.outbox_jitter_max_ms = 0;
             DO $$
             DECLARE
                 scenario text;
@@ -343,7 +348,7 @@ class Regression:
                                 CASE WHEN scenario = 'terminal' THEN 'response.invalid.terminal' ELSE 'test.retryable' END);
                         END IF;
                         RESET ROLE;
-                        ASSERT result = jsonb_build_object('updated',scenario <> 'confirmed'), 'unexpected update result';
+                        ASSERT result->>'updated' = (scenario <> 'confirmed')::text, 'unexpected update result';
                         SELECT * INTO STRICT current_row FROM delivery.outbox WHERE outbox_id=claimed.outbox_id;
                         ASSERT current_row.attempt_count = attempt, 'failure changed attempt count';
 
@@ -565,6 +570,122 @@ class Regression:
             self.stop_worker(worker)
         print("PASS: concurrent submit, atomic rollback and canonical events for receipt/auto/manual finals", flush=True)
 
+    def outbox_metrics_index(self):
+        # Real production query, mostly terminal history; all fixture DDL/DML rolls back.
+        evidence = json.loads(self.sql("""BEGIN;
+            SET LOCAL plpgsql.check_asserts = on;
+            CREATE TEMP TABLE metric_evidence(value jsonb);
+            DO $$
+            DECLARE pid uuid; baseline bigint; fast jsonb; slow jsonb; before jsonb; after jsonb;
+            BEGIN
+                SELECT outbox_pending INTO baseline FROM autocheck.metrics;
+                INSERT INTO workflow.process_instances(business_key,flow_name,flow_version)
+                VALUES ('metrics-index-fixture','payment-processing',1) RETURNING process_id INTO pid;
+                CREATE TEMP TABLE metric_ids AS SELECT gen_random_uuid() AS id,n FROM generate_series(1,20063) n;
+                INSERT INTO payment.operations(operation_id,principal,request_id,operation_kind,amount,currency,process_id)
+                SELECT id,'metrics-index-fixture',id::text,'PAYMENT_EXECUTION',1,'RUB',pid FROM metric_ids;
+                INSERT INTO delivery.external_requests(external_request_id,operation_id,process_id,correlation_id,payload_hash)
+                SELECT id::text,id,pid,gen_random_uuid(),repeat('0',64) FROM metric_ids;
+                INSERT INTO delivery.outbox(external_request_id,state,created_at,next_attempt_at)
+                SELECT id::text,CASE WHEN n<=20000 THEN 'CONFIRMED' WHEN n=20001 THEN 'DEAD'
+                    WHEN n=20002 THEN 'DELIVERED' ELSE (ARRAY['PENDING','LEASED','RETRY_WAIT'])[n%3+1] END,
+                    now()-interval '1 hour',now()+interval '1 hour' FROM metric_ids;
+                ANALYZE delivery.outbox;
+                SELECT jsonb_build_array(outbox_pending,outbox_oldest_age_seconds) INTO before FROM autocheck.metrics;
+                ASSERT (before->>0)::bigint=baseline+61, 'Outbox metric must include all active states, including future retry';
+                ASSERT (before->>1)::numeric>=3600, 'Oldest pending age must use created_at';
+                EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+                    SELECT outbox_pending,outbox_oldest_age_seconds FROM autocheck.metrics' INTO fast;
+                DROP INDEX delivery.outbox_pending_created_at_idx;
+                EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+                    SELECT outbox_pending,outbox_oldest_age_seconds FROM autocheck.metrics' INTO slow;
+                SELECT jsonb_build_array(outbox_pending,outbox_oldest_age_seconds) INTO after FROM autocheck.metrics;
+                ASSERT before=after, 'Index must not change metric values';
+                INSERT INTO metric_evidence VALUES(jsonb_build_object('indexed',fast->0,'unindexed',slow->0));
+            END $$;
+            SELECT value FROM metric_evidence;
+            ROLLBACK;""").stdout)
+        plans = {k: v["Plan"] for k, v in evidence.items()}
+        assert "outbox_pending_created_at_idx" in json.dumps(plans["indexed"]), plans["indexed"]
+        blocks = {k: v["Shared Hit Blocks"] + v["Shared Read Blocks"] for k, v in plans.items()}
+        assert blocks["indexed"] < blocks["unindexed"], blocks
+        print(f"PASS: unchanged Outbox metrics; query buffers indexed={blocks['indexed']}, unindexed={blocks['unindexed']}", flush=True)
+
+    def delivery_recovery_trace(self):
+        oid = self.operation("PAYMENT_EXECUTION", "100.00")
+        response = self.invoke("payment", "submit", {"operationId": oid})
+        pid = response["result"]["processId"]
+        worker = self.worker()
+        try:
+            wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == "WAITING_SIGNAL")
+        finally:
+            self.stop_worker(worker)
+        external = self.query(f"to_jsonb(external_request_id) FROM delivery.external_requests WHERE operation_id={literal(oid)}")
+
+        def claim(owner):
+            return self.query(f"COALESCE(jsonb_agg(to_jsonb(c)),'[]') FROM delivery.claim_outbox({literal(owner)},1) c", "outbox_dispatcher")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(pool.map(claim, ("first", "second")))
+        assert sorted(map(len, claims)) == [0, 1], claims
+        first = next(c[0] for c in claims if c)
+        owner = "first" if claims[0] else "second"
+        reclaimed = wait_for(lambda: claim("replacement"), bool, timeout=15)[0]
+        assert reclaimed["outbox_id"] == first["outbox_id"]
+        assert reclaimed["lease_version"] > first["lease_version"]
+        outbox_id = literal(first["outbox_id"])
+        stale = self.query(f"delivery.fail_outbox({outbox_id},{literal(owner)},{first['lease_version']},'test.retryable')", "outbox_dispatcher")
+        assert stale == {"updated": False}
+        for attempt in (2, 3, 4):
+            result = self.query(f"delivery.fail_outbox({outbox_id},'replacement',{reclaimed['lease_version']},'test.retryable')", "outbox_dispatcher")
+            assert result["updated"] and result["attemptCount"] == attempt, result
+            assert result["state"] == ("DEAD" if attempt == 4 else "RETRY_WAIT"), result
+            if attempt < 4:
+                reclaimed = wait_for(lambda: claim("replacement"), bool)[0]
+        dead = self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={outbox_id}")
+        assert dead["dead_at"] and dead["last_error_code"] == "test.retryable"
+        assert self.snapshot(pid)["process"] == "WAITING_SIGNAL"
+        assert self.query(f"to_jsonb(status) FROM payment.operations WHERE operation_id={literal(oid)}") == "PROCESSING"
+        stalled = self.invoke("diagnostics", "stalled", {})
+        assert {"operationId": oid, "processId": pid, "externalRequestId": external} in stalled["result"]["items"]
+
+        message_id = uuid.uuid4().hex
+        receipt = {"version": 1, "messageId": message_id, "externalRequestId": external,
+                   "providerPaymentId": message_id, "outcome": "COMPLETED", "occurredAt": "2026-01-01T00:00:00Z"}
+        extra = {"payloadHash": hashlib.sha256(json.dumps(receipt).encode()).hexdigest(),
+                 "transport": {"signatureVerified": True, "signatureVersion": 1}}
+        accepted = self.invoke("receipt", "accept", receipt, key=message_id, extra=extra)
+        assert accepted["status"] == "ok", accepted
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            counts = list(pool.map(lambda _: self.query("delivery.reconcile_inbox(10)", "inbox_reconciler"), range(2)))
+        assert sum(counts) == 1, counts
+        worker = self.worker()
+        try:
+            state = wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == "COMPLETED")
+        finally:
+            self.stop_worker(worker)
+        confirmed = self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={outbox_id}")
+        assert confirmed["state"] == "CONFIRMED"
+        assert all(confirmed[k] == dead[k] for k in ("dead_at", "last_error_code", "attempt_count"))
+        assert self.invoke("receipt", "accept", receipt, key=message_id, extra=extra)["status"] == "ok"
+        assert not self.invoke("diagnostics", "stalled", {})["result"]["items"]
+        trace = self.invoke("diagnostics", "trace", {"identifier": oid})["result"]
+        identifiers = {"operationId": oid, "processId": pid, "externalRequestId": external, "messageId": message_id,
+                       "requestId": trace["operation"]["requestId"], "correlationId": trace["dispatches"][0]["correlationId"],
+                       "stepInstanceId": trace["steps"][0]["stepInstanceId"], "jobId": trace["jobs"][0]["jobId"],
+                       "executionId": trace["jobs"][0]["executionId"], "attemptId": trace["attempts"][0]["attemptId"]}
+        facts = {k: v for k, v in trace.items() if k != "query"}
+        for kind, identifier in identifiers.items():
+            actual = self.invoke("diagnostics", "trace", {"identifier": identifier})["result"]
+            assert kind in actual["query"]["matchedBy"], (kind, actual["query"])
+            assert {k: v for k, v in actual.items() if k != "query"} == facts, kind
+        decision_id = self.query("to_jsonb(decision_id) FROM delivery.decisions ORDER BY created_at DESC LIMIT 1")
+        decision_trace = self.invoke("diagnostics", "trace", {"identifier": decision_id})["result"]
+        assert decision_trace["query"]["matchedBy"] == ["decisionId"]
+        assert any(d["decisionId"] == decision_id for d in decision_trace["decisions"])
+        assert self.invoke("diagnostics", "trace", {"identifier": "unknown-"+uuid.uuid4().hex})["code"] == "diagnostics.trace_not_found"
+        print("PASS: concurrent delivery/reconciliation, expiry, DEAD, late receipt, retained diagnostics and all 11 trace identifiers", flush=True)
+
     def close(self):
         for name in self.workers:
             self.run(["docker", "rm", "-f", name], ok=False)
@@ -583,13 +704,15 @@ def flow_map(action):
 
 
 if __name__ == "__main__":
-    with tempfile.TemporaryDirectory(prefix="moduledev-regression-") as temporary:
+    # Workspace paths are shared reliably by Docker Desktop across Windows/WSL.
+    with tempfile.TemporaryDirectory(prefix=".regression-", dir=ROOT / "scripts") as temporary:
         suite = Regression(Path(temporary))
         try:
             for test in (suite.upgrade, suite.fixtures, suite.immutability,
                          suite.competing_claims_and_fencing, suite.retry_budget, suite.outbox_retry_policy,
                          suite.signals, suite.mapping_and_policy, suite.crash_recovery,
-                         suite.telemetry_and_context, suite.payment_events):
+                         suite.telemetry_and_context, suite.payment_events, suite.delivery_recovery_trace,
+                         suite.outbox_metrics_index):
                 test()
             print("All workflow DB regressions passed.", flush=True)
         finally:

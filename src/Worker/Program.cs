@@ -16,14 +16,23 @@ var owner = Environment.GetEnvironmentVariable("COURSE_WORKER_OWNER")
 var dbConn = Environment.GetEnvironmentVariable("COURSE_DB_CONNECTION")
     ?? throw new InvalidOperationException("COURSE_DB_CONNECTION not set");
 var testProfile = Environment.GetEnvironmentVariable("COURSE_TEST_PROFILE") == "1";
-var failpoint = Environment.GetEnvironmentVariable("COURSE_FAILPOINT");
+var failpoint = testProfile ? Environment.GetEnvironmentVariable("COURSE_FAILPOINT") : null;
 
-var leaseSec = testProfile ? 2 : 30;
-var pollMs = testProfile ? 100 : 1000;
+var leaseMs = int.Parse(Environment.GetEnvironmentVariable("COURSE_JOB_LEASE_MS") ?? (testProfile ? "2000" : "30000"));
+var leaseSec = Math.Max(1, (int)Math.Ceiling(leaseMs / 1000.0));
+var pollMs = Math.Max(1,int.Parse(Environment.GetEnvironmentVariable("COURSE_WORKER_POLL_MS") ?? (testProfile ? "100" : "1000")));
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Logging.ClearProviders().AddJsonConsole();
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+var probes = builder.Build();
+Course.HealthEndpoints.Map(probes, dbConn);
+await probes.StartAsync();
 
 EmitEvent("worker.started", owner);
 
 var cts = new CancellationTokenSource();
+probes.Lifetime.ApplicationStopping.Register(cts.Cancel);
 Console.CancelKeyPress += (_, e) =>
 {
     e.Cancel = true;
@@ -87,6 +96,7 @@ while (!cts.Token.IsCancellationRequested)
 }
 
 EmitEvent("worker.stopped", owner);
+await probes.StopAsync();
 
 async Task<List<ClaimedJob>> ClaimJobsAsync(string connStr, string workerOwner, int limit, int leaseSeconds, CancellationToken ct)
 {
@@ -96,7 +106,11 @@ async Task<List<ClaimedJob>> ClaimJobsAsync(string connStr, string workerOwner, 
         await using var conn = new NpgsqlConnection(connStr);
         await conn.OpenAsync(ct);
 
-        await using var cmd = new NpgsqlCommand("SELECT workflow.claim_jobs(@owner, @limit, @sec)", conn);
+        await using var cmd = new NpgsqlCommand("""
+            SELECT COALESCE(jsonb_agg(j.value || jsonb_build_object('flowName',p.flow_name,'flowVersion',p.flow_version)),'[]')
+            FROM jsonb_array_elements(workflow.claim_jobs(@owner,@limit,@sec)) j
+            LEFT JOIN autocheck.processes p ON p.process_id=(j.value->>'processId')::uuid
+            """, conn);
         cmd.Parameters.AddWithValue("owner", workerOwner);
         cmd.Parameters.AddWithValue("limit", limit);
         cmd.Parameters.AddWithValue("sec", leaseSeconds);
@@ -146,7 +160,7 @@ async Task<List<ClaimedJob>> ClaimJobsAsync(string connStr, string workerOwner, 
                 leaseVersion, stepKey, service, module, action, actionVersion,
                 requiredPolicy, timeoutMs, inputMapping, inputConstants,
                 processData, expectedOutcomes, reqSchema, resSchema
-            ));
+            ) { FlowName = obj["flowName"]?.GetValue<string>(), FlowVersion = obj["flowVersion"]?.GetValue<int>() });
         }
     }
     catch (Exception) when (!ct.IsCancellationRequested)
@@ -158,7 +172,7 @@ async Task<List<ClaimedJob>> ClaimJobsAsync(string connStr, string workerOwner, 
 
 async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, string? activeFailpoint, CancellationToken ct)
 {
-    // Failpoint: after_job_claim
+    // Claim is already committed; a crash leaves a lease for another worker to reclaim.
     if (activeFailpoint == "after_job_claim")
     {
         EmitFailpoint("after_job_claim", workerOwner);
@@ -166,7 +180,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         return;
     }
 
-    // Apply mapping
+    // Missing paths fail the job; an existing JSON null is left to schema validation.
     var payload = job.InputConstants.DeepClone().AsObject();
     foreach (var (targetPtr, srcPtrNode) in job.InputMapping)
     {
@@ -180,7 +194,6 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         JsonPointer.Set(payload, targetPtr, val);
     }
 
-    // Validate request schema
     if (job.RequestSchema is not null)
     {
         var reqEval = job.RequestSchema.Evaluate(payload, new EvaluationOptions
@@ -195,7 +208,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         }
     }
 
-    // Build trusted server-side context from the service principal's permissions.
+    // Required policy cannot grant permissions: the worker has an independent allowlist.
     var workerScopes = Course.WorkflowPrincipal.Scopes;
     foreach (var policy in job.RequiredPolicy)
     {
@@ -211,7 +224,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
         ["principal"] = "workflow-worker",
         ["consumer"] = "internal",
         ["scopes"] = JsonSerializer.SerializeToNode(workerScopes),
-        ["correlationId"] = Guid.NewGuid().ToString(),
+        ["correlationId"] = job.CorrelationId.ToString(),
         ["requestId"] = job.ExecutionId.ToString(),
         ["processId"] = job.ProcessId.ToString(),
         ["jobId"] = job.JobId.ToString(),
@@ -228,14 +241,13 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
 
     try
     {
-        // 1. Set statement timeout
+        // Transaction-local timeout must not leak into the next pooled connection user.
         await using (var toCmd = new NpgsqlCommand("SELECT set_config('statement_timeout', @to, true)", conn, tx))
         {
             toCmd.Parameters.AddWithValue("to", $"{job.TimeoutMs}ms");
             await toCmd.ExecuteNonQueryAsync(ct);
         }
 
-        // 2. Execute api.invoke
         await using var invokeCmd = new NpgsqlCommand(
             "SELECT api.invoke(@mod, @act, @ver, @ctx::jsonb, @pld::jsonb)", conn, tx);
         invokeCmd.CommandTimeout = Math.Max(1, (int)Math.Ceiling(job.TimeoutMs / 1000.0) + 2);
@@ -296,7 +308,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
             }
         }
 
-        // Failpoint: after_action_before_finish
+        // The action effect is still uncommitted; SIGKILL here must roll it back.
         if (activeFailpoint == "after_action_before_finish")
         {
             EmitFailpoint("after_action_before_finish", workerOwner);
@@ -304,7 +316,7 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
             return;
         }
 
-        // 3. Finish job in same transaction
+        // Fencing failure rolls back the action as well as job completion.
         await using var finishCmd = new NpgsqlCommand(
             "SELECT workflow.finish_job(@jid, @owner, @lv, @outcome, @res::jsonb)", conn, tx);
         finishCmd.Parameters.AddWithValue("jid", job.JobId);
@@ -315,7 +327,6 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
 
         await finishCmd.ExecuteNonQueryAsync(ct);
 
-        // Commit both action effect and job completion atomically
         await tx.CommitAsync(ct);
         EmitEvent("worker.finish", workerOwner, job, outcome: outcome, jobState: "SUCCEEDED");
     }
@@ -343,6 +354,9 @@ async Task ProcessJobAsync(string connStr, string workerOwner, ClaimedJob job, s
 
 async Task FailJobAsync(string connStr, ClaimedJob job, string workerOwner, string errorCode, bool retryable)
 {
+    if (errorCode.Length > 128 ||
+        !System.Text.RegularExpressions.Regex.IsMatch(errorCode, @"\A[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\z"))
+        errorCode = "internal.error";
     try
     {
         await using var conn = new NpgsqlConnection(connStr);
@@ -384,9 +398,20 @@ void EmitEvent(string eventName, string instanceId, ClaimedJob? job = null,
     Console.WriteLine(JsonSerializer.Serialize(new
     {
         @event = eventName,
+        level = jobState == "DEAD" || eventName.EndsWith("error") ? "ERROR"
+            : errorCode is not null ? "WARNING" : "INFO",
         timestamp = DateTime.UtcNow,
         instanceId,
+        correlationId = job?.CorrelationId,
+        requestId = job?.ExecutionId.ToString(),
+        operationId = Guid.TryParse(job?.ProcessData["operationId"]?.ToString(), out var oid) ? (Guid?)oid : null,
         processId = job?.ProcessId,
+        stepKey = job?.StepKey,
+        action = job is null ? null : $"{job.Module}.{job.Action}",
+        actionVersion = job?.ActionVersion,
+        flow = job?.FlowName,
+        version = job?.FlowVersion,
+        durationMs = job is null ? 0 : (long)job.Elapsed.Elapsed.TotalMilliseconds,
         jobId = job?.JobId,
         executionId = job?.ExecutionId,
         attemptId = job?.AttemptId,
@@ -428,4 +453,10 @@ public record ClaimedJob(
     List<string> ExpectedOutcomes,
     JsonSchema? RequestSchema,
     JsonSchema? ResponseSchema
-);
+)
+{
+    public Guid CorrelationId { get; } = Guid.NewGuid();
+    public System.Diagnostics.Stopwatch Elapsed { get; } = System.Diagnostics.Stopwatch.StartNew();
+    public string? FlowName { get; set; }
+    public int? FlowVersion { get; set; }
+}

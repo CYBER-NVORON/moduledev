@@ -12,7 +12,7 @@ builder.Services.AddHttpClient("api", client =>
 
 var app = builder.Build();
 
-// --- Health: live is local, ready proxies to api ---
+// Liveness is local; readiness follows the API dependency.
 app.MapGet("/health/live", () => Results.Ok(new { status = "ok" }));
 
 app.MapGet("/health/ready", async (IHttpClientFactory httpFactory) =>
@@ -31,19 +31,17 @@ app.MapGet("/health/ready", async (IHttpClientFactory httpFactory) =>
     }
 });
 
-// --- Whitelisted proxy routes ---
+// Only these route families are forwarded to the internal API.
 app.Map("/api/{**rest}", async (HttpContext ctx, IHttpClientFactory httpFactory) =>
     await ProxyRequest(ctx, httpFactory));
 
 app.Map("/openapi/{**rest}", async (HttpContext ctx, IHttpClientFactory httpFactory) =>
     await ProxyRequest(ctx, httpFactory));
 
-// --- Fallback: 404 for everything else ---
 app.MapFallback(() => Results.NotFound(new { status = "error", code = "not_found", message = "route not found" }));
 
 app.Run();
 
-// --- Proxy Implementation ---
 async Task ProxyRequest(HttpContext ctx, IHttpClientFactory httpFactory)
 {
     var client = httpFactory.CreateClient("api");
@@ -57,7 +55,7 @@ async Task ProxyRequest(HttpContext ctx, IHttpClientFactory httpFactory)
             RequestUri = new Uri(path, UriKind.Relative),
         };
 
-        // Forward body for POST/PUT/PATCH
+        // Stream the original bytes so receipt signatures remain valid.
         if (ctx.Request.ContentLength > 0 || ctx.Request.ContentType is not null)
         {
             request.Content = new StreamContent(ctx.Request.Body);
@@ -77,7 +75,6 @@ async Task ProxyRequest(HttpContext ctx, IHttpClientFactory httpFactory)
 
         ctx.Response.StatusCode = (int)response.StatusCode;
 
-        // Copy response headers
         foreach (var (key, values) in response.Headers)
         {
             // Skip transfer-encoding to avoid conflicts with Kestrel's own chunked handling
