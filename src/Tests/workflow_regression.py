@@ -67,9 +67,10 @@ class Regression:
             "worker-b": {"image": self.project + "-worker"},
         }}
         (directory / "compose.json").write_text(json.dumps(override), encoding="utf-8")
+        (directory / "ports.yaml").write_text("services:\n  gateway:\n    ports: !reset []\n", encoding="utf-8")
         self.compose = ["docker", "compose", "--env-file", str(directory / "empty.env"),
                         "-p", self.project, "-f", str(ROOT / "compose.yaml"),
-                        "-f", str(directory / "compose.json")]
+                        "-f", str(directory / "compose.json"), "-f", str(directory / "ports.yaml")]
 
     def run(self, args, data=None, ok=True, timeout=120):
         result = subprocess.run(args, input=data, text=True, encoding="utf-8",
@@ -109,6 +110,7 @@ class Regression:
         return self.query(f"""jsonb_build_object(
             'process', (SELECT state FROM workflow.process_instances WHERE process_id={literal(pid)}),
             'jobs', (SELECT jsonb_agg(to_jsonb(j) ORDER BY job_id) FROM workflow.jobs j WHERE process_id={literal(pid)}),
+            'steps', (SELECT jsonb_agg(to_jsonb(s) ORDER BY step_instance_id) FROM workflow.step_instances s WHERE process_id={literal(pid)}),
             'attempts', (SELECT jsonb_agg(to_jsonb(a) ORDER BY attempt_number) FROM workflow.attempts a
                 JOIN workflow.jobs j USING(job_id) WHERE j.process_id={literal(pid)}),
             'events', (SELECT jsonb_agg(to_jsonb(e) ORDER BY event_id) FROM workflow.events e WHERE process_id={literal(pid)}),
@@ -117,13 +119,20 @@ class Regression:
     def expire(self, job):
         self.sql(f"UPDATE workflow.jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id={literal(job['jobId'])};")
 
-    def finish(self, job, owner):
+    def finish(self, job, owner, wait_for_expiry=False, check_live_lease=False):
         context = {"principal": "workflow-worker", "consumer": "internal",
                    "scopes": ["workflow:execute", "payment:internal"],
                    "requestId": job["executionId"], "correlationId": str(uuid.uuid4()),
                    **{key: job[key] for key in ("processId", "jobId", "executionId", "attemptId", "leaseVersion")}}
-        return self.sql(f"""BEGIN; SET LOCAL ROLE workflow_worker;
+        pause = (f"RESET ROLE; SELECT pg_sleep(greatest(0,extract(epoch FROM lease_until-clock_timestamp()))+0.05) "
+                 f"FROM workflow.jobs WHERE job_id={literal(job['jobId'])}; SET LOCAL ROLE workflow_worker;"
+                 if wait_for_expiry else "")
+        check = (f"DO $$ BEGIN ASSERT (SELECT lease_until > now() FROM workflow.jobs "
+                 f"WHERE job_id={literal(job['jobId'])}), 'test transaction must begin before lease expiry'; END $$;"
+                 if wait_for_expiry or check_live_lease else "")
+        return self.sql(f"""BEGIN; {check} SET LOCAL ROLE workflow_worker;
             SELECT api.invoke('regression', 'nullable', 1, {literal(context)}::jsonb, '{{"value":"ok"}}');
+            {pause}
             SELECT workflow.finish_job({literal(job['jobId'])}, {literal(owner)}, {job['leaseVersion']}, 'DONE', '{{}}');
             COMMIT;""", ok=False)
 
@@ -180,6 +189,7 @@ class Regression:
         assert "013_outbox_retry_policy.sql" in new
         assert "014_outbox_reliability.sql" in new
         assert "015_diagnostics.sql" in new
+        assert "016_lease_deadlines_and_stalled_age.sql" in new
         assert history == self.query(f"jsonb_agg(to_jsonb(e) ORDER BY event_id) FROM payment.operation_events e "
                                      f"WHERE operation_id={literal(legacy)}")
         expected = sorted(["OPERATION_CREATED", "OPERATION_SUBMITTED", "OPERATION_COMPLETED", "OPERATION_REJECTED"])
@@ -288,9 +298,54 @@ class Regression:
         assert sum(e["event_type"] == "TaskFailed" for e in state["events"]) == 1
         print("PASS: STALE does not consume retry budget; failure-indexed delays and exhaustion", flush=True)
 
+    def expired_completion(self):
+        for action in ("finish", "fail", "locked-finish"):
+            pid = self.start("regression-nullable", "expired-" + action, {"source": "ok"})
+            job = self.query("workflow.claim_jobs('expiry-owner',1,2)", "workflow_worker")[0]
+            before = self.snapshot(pid)
+            if action == "finish":
+                result = self.finish(job, "expiry-owner", wait_for_expiry=True)
+            elif action == "fail":
+                result = self.sql(f"""BEGIN;
+                    DO $$ BEGIN ASSERT (SELECT lease_until > now() FROM workflow.jobs WHERE job_id={literal(job['jobId'])}),
+                        'test transaction must begin before lease expiry'; END $$;
+                    SELECT pg_sleep(greatest(0,extract(epoch FROM lease_until-clock_timestamp()))+0.05)
+                    FROM workflow.jobs WHERE job_id={literal(job['jobId'])};
+                    SET LOCAL ROLE workflow_worker;
+                    SELECT workflow.fail_job({literal(job['jobId'])},'expiry-owner',{job['leaseVersion']},'test.retryable',true);
+                    COMMIT;""", ok=False)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    holder = pool.submit(self.sql, f"""BEGIN; SET application_name='expiry-blocker';
+                        SELECT 1 FROM workflow.jobs WHERE job_id={literal(job['jobId'])} FOR UPDATE;
+                        SELECT pg_sleep(3); COMMIT;""")
+                    wait_for(lambda: self.query("to_jsonb(EXISTS(SELECT 1 FROM pg_stat_activity "
+                        "WHERE application_name='expiry-blocker' AND wait_event='PgSleep'))"), bool)
+                    result = self.finish(job, "expiry-owner", check_live_lease=True)
+                    holder.result(timeout=10)
+            assert result.returncode and "workflow.lease_stale" in result.stderr, f"Expired {action} accepted: {result.stdout}"
+            assert self.snapshot(pid) == before, "Expiry rejection must preserve jobs, steps, attempts, events and effects"
+            replacement = self.claim("replacement")[0]
+            assert replacement["executionId"] == job["executionId"]
+            assert replacement["leaseVersion"] > job["leaseVersion"]
+            assert self.finish(replacement, "replacement").returncode == 0
+            after = self.snapshot(pid)
+            assert after["effects"] == 1 and after["process"] == "COMPLETED"
+        pid = self.start("regression-nullable", "null-fencing", {"source": "ok"})
+        job = self.claim("valid-owner")[0]
+        before = self.snapshot(pid)
+        for owner, version in (("NULL", str(job["leaseVersion"])), ("'valid-owner'", "NULL")):
+            for action, arguments in (("finish", "'DONE','{}'"), ("fail", "'test.retryable',true")):
+                result = self.sql(f"SET ROLE workflow_worker; SELECT workflow.{action}_job("
+                    f"{literal(job['jobId'])},{owner},{version},{arguments});", ok=False)
+                assert result.returncode and "workflow.lease_stale" in result.stderr
+                assert self.snapshot(pid) == before
+        assert self.finish(job, "valid-owner").returncode == 0
+        print("PASS: expiry before reclaim and after lock wait rejects finish/fail; rollback, recovery and NULL fencing", flush=True)
+
     def outbox_retry_policy(self):
-        # No dispatcher/worker runs here. Fixtures and simulated elapsed delays are
-        # rolled back; one transaction makes now() stable for exact delay assertions.
+        # No dispatcher/worker runs here. Check delays against wall-clock bounds;
+        # a transaction-start timestamp would hide skipped backoff in a long transaction.
         self.sql("""BEGIN;
             SET LOCAL plpgsql.check_asserts = on;
             SET LOCAL course.outbox_jitter_max_ms = 0;
@@ -305,6 +360,8 @@ class Regression:
                 before_row jsonb;
                 result jsonb;
                 attempt integer;
+                failure_started timestamptz;
+                failure_finished timestamptz;
             BEGIN
                 FOREACH scenario IN ARRAY ARRAY['exhausted','success','terminal','confirmed'] LOOP
                     oid := gen_random_uuid();
@@ -341,12 +398,14 @@ class Regression:
                             UPDATE delivery.outbox SET state='CONFIRMED' WHERE outbox_id=claimed.outbox_id;
                         END IF;
                         SET LOCAL ROLE outbox_dispatcher;
+                        failure_started := clock_timestamp();
                         IF scenario = 'success' AND attempt = 4 THEN
                             result := delivery.succeed_outbox(claimed.outbox_id,'retry-probe',claimed.lease_version,'provider-id');
                         ELSE
                             result := delivery.fail_outbox(claimed.outbox_id,'retry-probe',claimed.lease_version,
                                 CASE WHEN scenario = 'terminal' THEN 'response.invalid.terminal' ELSE 'test.retryable' END);
                         END IF;
+                        failure_finished := clock_timestamp();
                         RESET ROLE;
                         ASSERT result->>'updated' = (scenario <> 'confirmed')::text, 'unexpected update result';
                         SELECT * INTO STRICT current_row FROM delivery.outbox WHERE outbox_id=claimed.outbox_id;
@@ -370,7 +429,9 @@ class Regression:
                         END IF;
 
                         ASSERT current_row.state = 'RETRY_WAIT', 'retry stopped before fourth attempt';
-                        ASSERT extract(epoch FROM current_row.next_attempt_at-now())*1000 = (ARRAY[200,400,800])[attempt],
+                        ASSERT current_row.next_attempt_at BETWEEN
+                            failure_started + make_interval(secs=>(ARRAY[0.2,0.4,0.8])[attempt]) AND
+                            failure_finished + make_interval(secs=>(ARRAY[0.2,0.4,0.8])[attempt]),
                             'incorrect retry delay';
                         SET LOCAL ROLE outbox_dispatcher;
                         ASSERT NOT EXISTS (SELECT 1 FROM delivery.claim_outbox('retry-probe',1)), 'retry claimed too early';
@@ -630,6 +691,20 @@ class Regression:
         assert sorted(map(len, claims)) == [0, 1], claims
         first = next(c[0] for c in claims if c)
         owner = "first" if claims[0] else "second"
+        outbox_id = literal(first["outbox_id"])
+        before_expiry = self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={outbox_id}")
+        self.sql(f"""BEGIN;
+            DO $$ BEGIN ASSERT (SELECT lease_until > now() FROM delivery.outbox WHERE outbox_id={outbox_id}),
+                'test transaction must begin before Outbox lease expiry'; END $$;
+            SELECT pg_sleep(greatest(0,extract(epoch FROM lease_until-clock_timestamp()))+0.05)
+            FROM delivery.outbox WHERE outbox_id={outbox_id};
+            SET LOCAL ROLE outbox_dispatcher;
+            DO $$ BEGIN
+                ASSERT delivery.succeed_outbox({outbox_id},{literal(owner)},{first['lease_version']},'expired') = '{{"updated":false}}'::jsonb;
+                ASSERT delivery.fail_outbox({outbox_id},{literal(owner)},{first['lease_version']},'test.retryable') = '{{"updated":false}}'::jsonb;
+            END $$;
+            COMMIT;""")
+        assert self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={outbox_id}") == before_expiry
         reclaimed = wait_for(lambda: claim("replacement"), bool, timeout=15)[0]
         assert reclaimed["outbox_id"] == first["outbox_id"]
         assert reclaimed["lease_version"] > first["lease_version"]
@@ -647,7 +722,20 @@ class Regression:
         assert self.snapshot(pid)["process"] == "WAITING_SIGNAL"
         assert self.query(f"to_jsonb(status) FROM payment.operations WHERE operation_id={literal(oid)}") == "PROCESSING"
         stalled = self.invoke("diagnostics", "stalled", {})
-        assert {"operationId": oid, "processId": pid, "externalRequestId": external} in stalled["result"]["items"]
+        assert {"operationId": oid, "processId": pid, "externalRequestId": external} not in stalled["result"]["items"]
+        # A single statement freezes the observation time; roll back synthetic timestamps.
+        self.sql(f"""BEGIN; DO $$
+            DECLARE offset_us integer; items jsonb;
+            BEGIN
+                FOREACH offset_us IN ARRAY ARRAY[-1,0,1] LOOP
+                    UPDATE delivery.outbox SET dead_at=statement_timestamp()-interval '10 seconds'
+                        + offset_us*interval '1 microsecond' WHERE outbox_id={outbox_id};
+                    items := diagnostics.stalled_v1('{{}}','{{}}')#>'{{result,items}}';
+                    ASSERT (items @> jsonb_build_array(jsonb_build_object('operationId',{literal(oid)}))) = (offset_us<=0),
+                        'stalled age boundary must include exactly 10 seconds';
+                END LOOP;
+            END $$; ROLLBACK;""")
+        assert self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={outbox_id}") == dead
 
         message_id = uuid.uuid4().hex
         receipt = {"version": 1, "messageId": message_id, "externalRequestId": external,
@@ -709,7 +797,7 @@ if __name__ == "__main__":
         suite = Regression(Path(temporary))
         try:
             for test in (suite.upgrade, suite.fixtures, suite.immutability,
-                         suite.competing_claims_and_fencing, suite.retry_budget, suite.outbox_retry_policy,
+                         suite.competing_claims_and_fencing, suite.expired_completion, suite.retry_budget, suite.outbox_retry_policy,
                          suite.signals, suite.mapping_and_policy, suite.crash_recovery,
                          suite.telemetry_and_context, suite.payment_events, suite.delivery_recovery_trace,
                          suite.outbox_metrics_index):

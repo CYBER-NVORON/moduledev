@@ -74,7 +74,7 @@ Compose читает окружение хоста и `.env`. Значения �
 
 ### Миграции
 
-SQL-файлы находятся в `migrations/`. На пустом volume PostgreSQL создаёт роли, применяет `001..015` и записывает SHA-256 файлов. При последующих запусках CLI проверяет checksums и применяет новые миграции.
+SQL-файлы находятся в `migrations/`. На пустом volume PostgreSQL создаёт роли, применяет `001..016` и записывает SHA-256 файлов. При последующих запусках CLI проверяет checksums и применяет новые миграции.
 
 Применённые файлы сохраняют имя и содержимое. При несовпадении checksum мигратор останавливается. Для обновления существующей БД сначала остановите обработчики и выполните административную подготовку роли наблюдателя: [порядок обновления](docs/configuration.md#обновление-бд).
 
@@ -116,7 +116,7 @@ docker compose run --rm -v "./:/input:ro" cli flow signal <process-id> --type <s
 
 Два worker конкурентно захватывают jobs через `FOR UPDATE SKIP LOCKED`. Claim фиксируется короткой транзакцией; затем action, проверка результата и `finish_job` выполняются в одной транзакции.
 
-После истечения lease другой worker может повторить шаг. `jobId` и `executionId` сохраняются, `attemptId` создаётся заново, `leaseVersion` увеличивается. Устаревший finish откатывает предметный эффект. Ошибка записывается отдельным `fail_job`; `STALE` остаётся в истории, но не расходует бюджет ошибок.
+После истечения lease другой worker может повторить шаг. `jobId` и `executionId` сохраняются, `attemptId` создаётся заново, `leaseVersion` увеличивается. Просроченные finish/fail отклоняются и до повторного захвата; проверка выполняется по текущему времени после блокировки job. Устаревший finish откатывает предметный эффект. Ошибка записывается отдельным `fail_job`; `STALE` остаётся в истории, но не расходует бюджет ошибок.
 
 Идентификаторы исполнения и права worker поступают из доверенного контекста, независимо от payload. Подробности: [ADR lease/fencing](docs/adr-lease-fencing.md).
 
@@ -179,9 +179,12 @@ python -m unittest discover -s src/Python/tests
 python -m unittest discover -s scripts/tests
 python src/Tests/workflow_regression.py
 python src/Tests/reliability_regression.py
+python src/Tests/startup_regression.py
 ```
 
-C# unit-тестам нужен .NET SDK 10. DB-регрессиям нужны Python 3.10+ и Docker Compose; они создают отдельный стенд и удаляют его после проверки. [CI](.github/workflows/db-regressions.yml) запускает wrapper tests и DB-регрессии. Состав сценариев, параметры wrapper и устранение ошибок запуска: [проверки](docs/testing.md).
+Для отдельной холодной сборки с ограничением BuildKit до 1 CPU / 2 ГиБ: `python src/Tests/startup_regression.py --limited-build`. Оба режима проверяют запуск на пустых томах, включая лимиты 0,5 CPU / 512 МиБ и 0,25 CPU / 256 МиБ на каждый контейнер. [Методика замеров](docs/testing.md#замеры-сборки-и-запуска).
+
+C# unit-тестам нужен .NET SDK 10. DB-регрессиям нужны Python 3.10+ и Docker Compose; они создают отдельный стенд и удаляют его после проверки. [CI](.github/workflows/db-regressions.yml) запускает wrapper tests, DB-регрессии, аварийные сценарии и первый запуск на пустых томах. Состав сценариев, параметры wrapper и устранение ошибок запуска: [проверки](docs/testing.md).
 
 ### Диагностика
 
@@ -195,7 +198,7 @@ docker compose logs -f outbox-dispatcher outbox-dispatcher-b receipt-adapter inb
 
 API, workers и Python-сервисы предоставляют внутренние health/metrics. Readiness зависит от PostgreSQL; у adapter — от gateway. Недоступность provider отражается в Outbox и не делает API неготовым.
 
-`diagnostics.trace` восстанавливает цепочку операции по сохранённым связям БД. `diagnostics.stalled` находит операции, ожидающие квитанцию после исчерпания доставки. Оба action требуют `diagnostics:read`.
+`diagnostics.trace` восстанавливает цепочку операции по сохранённым связям БД. `diagnostics.stalled` находит операции, ожидающие квитанцию не менее 10 секунд после перехода доставки в `DEAD`. Оба action требуют `diagnostics:read`.
 
 Форматы метрик и логов: [наблюдаемость](docs/observability-contracts.md). Команды trace/stalled и порядок восстановления: [runbook](docs/reliability.md).
 

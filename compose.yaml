@@ -177,7 +177,8 @@ services:
       - pg_isready -h 127.0.0.1 -U postgres -d course
       interval: 2s
       timeout: 3s
-      retries: 10
+      start_period: 120s
+      retries: 30
     networks:
     - course-net
     command:

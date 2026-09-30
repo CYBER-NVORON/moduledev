@@ -20,3 +20,7 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests
       - name: Run isolated PostgreSQL and worker regressions
         run: python3 -u src/Tests/workflow_regression.py
+      - name: Check crash recovery and stalled age over HTTP
+        run: python3 -u src/Tests/reliability_regression.py
+      - name: Check first startup on empty volumes
+        run: python3 -u src/Tests/startup_regression.py

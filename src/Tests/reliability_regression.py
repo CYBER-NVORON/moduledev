@@ -40,7 +40,7 @@ class Reliability(Regression):
         signature = hmac.new(self.env["COURSE_JWT_SIGNING_KEY"].encode(), body.encode(), hashlib.sha256).digest()
         return body+"."+base64.urlsafe_b64encode(signature).decode().rstrip("=")
 
-    def http(self, service, path, payload=None, key=None, signed=False):
+    def http(self, service, path, payload=None, key=None, signed=False, probe_service="receipt-adapter"):
         body = None if payload is None else json.dumps(payload, separators=(",", ":"), sort_keys=True)
         headers = {"Authorization": "Bearer "+self.token, "Content-Type": "application/json"}
         if key:
@@ -48,7 +48,7 @@ class Reliability(Regression):
         if signed:
             headers["X-Provider-Signature"] = "v1="+hmac.new(self.env["PROVIDER_HMAC_SECRET"].encode(), body.encode(), hashlib.sha256).hexdigest()
         port = 8082 if service == "receipt-adapter" else 8080
-        # The adapter is also the probe client: it has both HTTP routes, no DB credentials.
+        # Public routes use the adapter; internal probes can use an existing Python service on course-net.
         code = """import json,sys,urllib.request,urllib.error
 d=json.load(sys.stdin)
 request=urllib.request.Request(d['url'],data=None if d['body'] is None else d['body'].encode(),headers=d['headers'])
@@ -60,7 +60,7 @@ except urllib.error.HTTPError as error:
 except (OSError,urllib.error.URLError):
     print(json.dumps({'status':0,'body':''}))
 """
-        result = self.run(self.compose+["exec", "-T", "receipt-adapter", "python", "-c", code],
+        result = self.run(self.compose+["exec", "-T", probe_service, "python", "-c", code],
                           data=json.dumps({"url": f"http://{service}:{port}{path}", "body": body, "headers": headers}), timeout=30)
         return json.loads(result.stdout)
 
@@ -194,6 +194,68 @@ except (OSError,urllib.error.URLError):
                     self.stop_worker(name)
             self.run(self.compose+["up", "-d", "--no-deps", "provider-simulator"])
 
+    def stalled_age(self):
+        self.run(self.compose+["stop", "provider-simulator"])
+        dispatcher = self.component("outbox-dispatcher")
+        reconciler = None
+        operations = []
+
+        def items():
+            response = self.http("gateway", "/api/diagnostics/stalled", {})
+            assert response["status"] == 200, response
+            return json.loads(response["body"])["result"]["items"]
+
+        try:
+            for name in ("older", "fresh"):
+                key = uuid.uuid4().hex
+                response = self.http("gateway", "/api/payment/request",
+                    {"operationKind": "PAYMENT_EXECUTION", "amount": "1000.00", "currency": "RUB"}, key)
+                assert response["status"] == 200, response
+                oid = json.loads(response["body"])["result"]["operationId"]
+                response = self.http("gateway", "/api/payment/submit", {"operationId": oid}, uuid.uuid4().hex)
+                assert response["status"] == 200, response
+                pid = json.loads(response["body"])["result"]["processId"]
+                row = wait_for(lambda: self.query(f"COALESCE((SELECT to_jsonb(o) FROM delivery.outbox o JOIN delivery.external_requests e "
+                    f"USING(external_request_id) WHERE e.operation_id={literal(oid)}),'null'::jsonb)"),
+                    lambda row: row is not None and row["state"] == "DEAD", timeout=20)
+                assert row["attempt_count"] == 4
+                operations.append((oid, pid, row))
+                assert oid not in {item["operationId"] for item in items()}, "Fresh DEAD must not be stalled"
+                if name == "older":
+                    wait_for(lambda: self.query(f"to_jsonb(clock_timestamp() >= dead_at+interval '10 seconds') "
+                        f"FROM delivery.outbox WHERE outbox_id={literal(row['outbox_id'])}"), bool, timeout=40)
+            before = {pid: self.snapshot(pid) for _, pid, _ in operations}
+            observed = items()
+            identifiers = [item["operationId"] for item in observed]
+            assert identifiers == sorted(set(identifiers))
+            assert operations[0][0] in identifiers and operations[1][0] not in identifiers
+            assert {pid: self.snapshot(pid) for _, pid, _ in operations} == before
+            for oid, _, row in operations:
+                assert self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={literal(row['outbox_id'])}") == row
+                assert self.query(f"count(*) FROM delivery.external_requests WHERE operation_id={literal(oid)}") == 1
+            self.run(self.compose+["restart", "postgres", "api"], timeout=120)
+            wait_for(lambda: self.http("api", "/health/ready"), lambda r: r["status"] == 200, timeout=60)
+            assert operations[0][0] in {item["operationId"] for item in items()}, "Persisted age must survive restart"
+            assert {pid: self.snapshot(pid) for _, pid, _ in operations} == before
+            reconciler = self.component("inbox-reconciler")
+            for oid, pid, row in operations:
+                key = uuid.uuid4().hex
+                receipt = {"version": 1, "messageId": key, "externalRequestId": row["external_request_id"],
+                    "providerPaymentId": key, "outcome": "COMPLETED", "occurredAt": "2026-01-01T00:00:00Z"}
+                assert self.http("gateway", "/api/receipt/accept", receipt, key, True)["status"] == 200
+                wait_for(lambda: self.snapshot(pid), lambda s: s["process"] == "COMPLETED")
+                assert oid not in {item["operationId"] for item in items()}
+                assert self.event_types(oid).count("OPERATION_COMPLETED") == 1
+                assert self.query(f"count(*) FROM delivery.external_requests WHERE operation_id={literal(oid)}") == 1
+                confirmed = self.query(f"to_jsonb(o) FROM delivery.outbox o WHERE outbox_id={literal(row['outbox_id'])}")
+                assert confirmed["state"] == "CONFIRMED" and confirmed["dead_at"] == row["dead_at"]
+            print("PASS: HTTP stalled excludes fresh DEAD, includes 10-second-old DEAD, survives restart and clears on receipt", flush=True)
+        finally:
+            for name in (dispatcher, reconciler):
+                if name:
+                    self.stop_worker(name)
+            self.run(self.compose+["up", "-d", "--no-deps", "provider-simulator"])
+
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix=".regression-", dir=ROOT / "scripts") as directory:
@@ -209,6 +271,7 @@ if __name__ == "__main__":
                 suite.api_crashes()
                 suite.dispatcher_crashes()
                 suite.provider_outage()
+                suite.stalled_age()
             finally:
                 suite.stop_worker(worker)
             print("All six crash boundaries passed.", flush=True)

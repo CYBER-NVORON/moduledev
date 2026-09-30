@@ -10,6 +10,8 @@ Runbook описывает доставку, диагностику и восс�
 
 Миграции `001..013` не изменены. `014_outbox_reliability.sql` добавляет `lease_until`, `dead_at` и настраиваемую политику повторов. `015_diagnostics.sql` добавляет безопасные связи dispatch → operation/process, две диагностические actions и представление метрик. Старый SQL dispatcher сохранён как закрытая `api.invoke_core`; обёртка записывает связи в той же транзакции. Trace не извлекает identifiers из логов, body или хешей.
 
+Миграция `016_lease_deadlines_and_stalled_age.sql` проверяет действительность lease jobs и Outbox по `clock_timestamp()` после блокировки строки, в том числе до следующего claim. В Outbox сроки lease, retry и перехода в `DEAD` также используют фактическое время. Миграция добавляет 10-секундный порог `stalled`, сохраняя checksums `001..015` и прежние права SQL-функций.
+
 Для старого volume перед применением миграций нужен административный `prepare_database.sql`: создать `autocheck_reader`, установить его пароль из окружения и отозвать прежние PUBLIC-привилегии. Он выполняется автоматически при чистом initdb, отдельно — при обновлении. Исторические dispatches связываются только там, где сохранённые requestId/principal или executionId позволяют доказать связь; восстановить отсутствовавшие в старой БД сведения невозможно.
 
 В состав миграции `015_diagnostics.sql` также входит частичный индекс по `delivery.outbox.created_at` для состояний `PENDING`, `LEASED`, `RETRY_WAIT`. Индекс не меняет поведение доставки, значения метрик или JSON-контракты. Создание индекса выполняется в обычной транзакции мигратора; на существующем volume применяйте его с остановленными обработчиками по процедуре обновления в README.
@@ -74,7 +76,7 @@ Trace принимает correlationId, requestId, operationId, processId, stepI
 
 Trace возвращает все сохранённые факты цепочки. Пагинация и усечение не предусмотрены текущей схемой ответа. Стоимость запроса и размер ответа растут с историей; timeout действия не ограничивает память агрегации.
 
-Stalled возвращает уникальные операции с сочетанием `Outbox.DEAD + process.WAITING_SIGNAL + operation.PROCESSING`. `items` содержит только operationId/processId/externalRequestId, сортируется по operationId. Пустая выборка — `items: []`. Никакие jobs или новые отправки этим запросом не создаются.
+Stalled возвращает уникальные операции с сочетанием `Outbox.DEAD + process.WAITING_SIGNAL + operation.PROCESSING`, если с сохранённого `dead_at` прошло не менее 10 секунд. Свежая DEAD операция до этой границы отсутствует в выборке; её можно найти через trace. [Правило возраста и расчёт запаса](observability-contracts.md#diagnosticsstalled) не зависят от времени запуска процесса. `items` содержит только operationId/processId/externalRequestId, сортируется по operationId. Пустая выборка — `items: []`. Никакие jobs или новые отправки этим запросом не создаются.
 
 `autocheck_reader` имеет LOGIN с внешним паролем, SELECT только безопасных views `autocheck`, без role membership, application EXECUTE, физического DML, CREATE/TEMP или sequence privileges. Диагностика не содержит JWT, HMAC/signature, паролей, полного payload/body, callback message или manual reason.
 
